@@ -1,0 +1,12 @@
+envs/
+.venv/
+venv/
+__pycache__/
+*.pyc
+train/
+valid/
+test/
+runs/
+*.pt
+*.onnx
+*.cache
