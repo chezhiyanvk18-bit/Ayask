@@ -10,3 +10,5 @@ runs/
 *.pt
 *.onnx
 *.cache
+
+server.zip

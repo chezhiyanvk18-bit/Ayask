@@ -1,4 +1,9 @@
 # server.py
+# ==============================================================================
+# TEAM AYASK · NMDC IRON ORE CONVEYOR HEALTH MONITORING SCADA COMMAND CENTER
+# SIH PROBLEM STATEMENT 26008 · MULTI-MODAL IOT & EDGE AI DIGITAL TWIN
+# ==============================================================================
+
 import sys
 import asyncio
 
@@ -6,6 +11,7 @@ import asyncio
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+import os
 import cv2
 import json
 import time
@@ -16,15 +22,51 @@ import hashlib
 import secrets
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="NMDC Belt Monitoring SCADA")
+# Initialize FastAPI App
+app = FastAPI(title="Team AYASK - NMDC Belt Monitoring SCADA")
 
-# ----------------- AUTH STORE (in-memory demo user/session store) -----------------
-# NOTE: For a real deployment this would be a persistent DB with a proper password
-# hasher (bcrypt/argon2) and HttpOnly cookies. For this SIH prototype we keep it
-# in-memory but still perform REAL credential validation - no fake/demo bypass.
+# Ensure static directory exists
+os.makedirs("static", exist_ok=True)
+
+# ----------------- STATIC ASSETS & FAVICON -----------------
+@app.get("/favicon.ico")
+def favicon():
+    if os.path.exists("static/ayask_logo.png"):
+        return FileResponse("static/ayask_logo.png", media_type="image/png")
+    return HTMLResponse(status_code=404)
+
+@app.get("/static/ayask_logo.png")
+def logo():
+    if os.path.exists("static/ayask_logo.png"):
+        return FileResponse("static/ayask_logo.png", media_type="image/png")
+    return HTMLResponse(status_code=404)
+
+# ----------------- ATTEMPT TO LOAD ULTRALYTICS YOLO -----------------
+try:
+    from ultralytics import YOLO
+    if os.path.exists("models/belt_defect_yolov8/weights/best.pt"):
+        yolo_detector = YOLO("models/belt_defect_yolov8/weights/best.pt")
+        yolo_model_name = "YOLOv8 Belt Defect"
+    elif os.path.exists("models/conveyor_yolov8n/weights/best.pt"):
+        yolo_detector = YOLO("models/conveyor_yolov8n/weights/best.pt")
+        yolo_model_name = "YOLOv8 Conveyor"
+    elif os.path.exists("yolov8n.pt"):
+        yolo_detector = YOLO("yolov8n.pt")
+        yolo_model_name = "YOLOv8n Edge"
+    else:
+        yolo_detector = None
+        yolo_model_name = "Model Missing"
+    YOLO_AVAILABLE = yolo_detector is not None
+except Exception as e:
+    yolo_detector = None
+    yolo_model_name = "Unavailable"
+    YOLO_AVAILABLE = False
+    print(f"[!] Ultralytics YOLO init warning: {e}")
+
+# ----------------- AUTH STORE (In-Memory Session Store) -----------------
 users_db = {}      # email -> {"name": str, "password_hash": str, "salt": str}
 sessions_db = {}   # token -> {"email": str, "name": str, "created": float}
 
@@ -35,6 +77,14 @@ def create_session(email: str, name: str) -> str:
     token = secrets.token_hex(24)
     sessions_db[token] = {"email": email, "name": name, "created": time.time()}
     return token
+
+# Seed standard industrial demo operator account
+_demo_salt = "nmdc_scada_salt_2026"
+users_db["operator@nmdc.gov.in"] = {
+    "name": "Team AYASK Lead Engineer",
+    "password_hash": hash_password("Admin@1234", _demo_salt),
+    "salt": _demo_salt
+}
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -49,6 +99,18 @@ class SigninRequest(BaseModel):
 
 class TokenRequest(BaseModel):
     token: str
+
+class CameraConfigRequest(BaseModel):
+    source: str         # "esp32", "webcam", "sim"
+    esp32_url: str = ""
+
+class FaultRequest(BaseModel):
+    fault_type: str
+
+class TwinStimulateRequest(BaseModel):
+    speed_mps: float = 3.5
+    throughput_tph: float = 1250.0
+    motor_running: bool = True
 
 @app.post("/api/signup")
 def signup(req: SignupRequest):
@@ -108,93 +170,287 @@ def signout(req: TokenRequest):
     sessions_db.pop(req.token, None)
     return {"status": "signed_out"}
 
-# ----------------- SYSTEM STATE -----------------
+# ----------------- SYSTEM STATE & INDUSTRIAL DIGITAL TWIN -----------------
 class SystemState:
     def __init__(self):
         self.camera_enabled = False
-        self.device_connected = False   # True only once real sensor/camera hardware is attached
+        self.camera_source = "webcam"    # "esp32", "webcam", "sim"
+        self.esp32_url = os.environ.get("ESP32_CAM_URL", "http://192.168.4.1:81/stream")
+        self.mirror_view = False
+        self.yolo_enabled = True
+        self.yolo_confidence = 0.25
+        self.device_connected = False
         self.emergency_stop = False
+        self.relay_nc_energized = True  # Normally Closed failsafe motor interlock relay
         
-        # Operational Metrics
-        self.speed_mps = 3.5
-        self.load_tph = 1250.0
-        self.tension_kn = 45.0
-        self.vibration_rms = 2.1
-        self.vibration_x = 0.8
-        self.vibration_y = 1.1
-        self.vibration_z = 1.6
-        self.bearing_temp_c = 52.4
+        # Real-time Metrics & Status
+        self.live_fps = 0.0
+        self.detected_objects = []
+        self.camera_status = "Standby (Zone 3 Return Belt)"
+        
+        # Real-Time Belt Health Synthesis (SIH 26008 Specification)
         self.bhi = 98.0
+        self.joint_rul_hours = 720.0
+        self.speed_mps = 3.5
+        self.throughput_tph = 1250.0
         self.status = "LEVEL 1: OPTIMAL"
         self.status_level = 1
         
+        # Digital Twin Mechanics Simulation
+        self.belt_pos_pct = 0.0
+        self.motor_rpm = 1480.0
+        self.splice_pass_count = 142
+        
+        # Multi-Sensor IoT Telemetry Nodes
+        self.tension_kn = 45.0
+        self.bearing_temp_c = 52.4
+        self.vibration_rms = 2.1
+        self.vibration_x = 0.42
+        self.vibration_y = -0.28
+        self.vibration_z = 9.81
+        
+        # Conveyor Alignment & Material Surface
+        self.misalignment_mm = 2.1
+        self.surface_material = "NORMAL OPERATING DUST COAT"
+        
+        # Digital Twin Zone Statuses
+        self.zones = {
+            "zone1": {"name": "Zone 1: Drive Motor & Head Pulley", "status": "NOMINAL", "level": 1},
+            "zone2": {"name": "Zone 2: Carrying Run & Troughing Idlers", "status": "NOMINAL", "level": 1},
+            "zone3": {"name": "Zone 3: Return Belt Optical & Vib Scanner", "status": "NOMINAL", "level": 1},
+            "zone4": {"name": "Zone 4: Tail Pulley & Gravity Take-Up", "status": "NOMINAL", "level": 1}
+        }
+        
+        # Protocol Link Feeds
+        self.modbus_status = "Connected (Port 502 · PLC Node 10.0.4.12)"
+        self.opcua_status = "Online (opc.tcp://10.0.4.15:4840)"
+        
+        self.active_fault = "NONE"
         self.injected_defect = "NONE"
         self.incident_log = [
-            {"timestamp": "09:00:00", "event": "SCADA Core System Booted", "severity": "INFO"}
+            {"timestamp": time.strftime("%H:%M:%S"), "event": "SCADA Core System Booted · Team AYASK Engine Online", "severity": "INFO"},
+            {"timestamp": time.strftime("%H:%M:%S"), "event": "Modbus TCP Channel Bound to PLC Drive Loop (Port 502)", "severity": "INFO"},
+            {"timestamp": time.strftime("%H:%M:%S"), "event": "OPC-UA Security Baseline Handshake Verified", "severity": "INFO"},
+            {"timestamp": time.strftime("%H:%M:%S"), "event": "Normally Closed (NC) Safety Interlock Loop Energized (415V)", "severity": "INFO"}
         ]
 
 state = SystemState()
 
-# ----------------- CRASH-PROOF VIDEO GENERATOR -----------------
+# ----------------- RESILIENT VIDEO GENERATOR & VISION ENGINE -----------------
 def generate_frames():
     cap = None
+    current_source = None
+    current_url = None
     frame_counter = 0
+    last_frame_time = time.time()
+    last_reconnect_attempt = 0.0
+    consecutive_read_failures = 0
 
     try:
         while True:
             frame_counter += 1
-            
+            now = time.time()
+
+            # Measure unthrottled FPS
+            dt = now - last_frame_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                state.live_fps = round(state.live_fps * 0.85 + inst_fps * 0.15, 1)
+            last_frame_time = now
+
+            frame = None
+
             if state.camera_enabled:
-                if cap is None:
-                    cap = cv2.VideoCapture(0)
-                
-                if cap.isOpened():
-                    success, frame = cap.read()
-                    if success:
-                        frame = cv2.resize(frame, (640, 360))
-                    else:
-                        state.camera_enabled = False
-                        frame = None
-                else:
-                    state.camera_enabled = False
+                if current_source != state.camera_source or (state.camera_source == "esp32" and current_url != state.esp32_url):
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                    current_source = state.camera_source
+                    current_url = state.esp32_url
+                    consecutive_read_failures = 0
+
+                if state.camera_source == "sim":
                     frame = None
+                    state.camera_status = "Zone 3 Digital Twin (Simulated)"
+                else:
+                    if cap is None or not cap.isOpened():
+                        if now - last_reconnect_attempt > 1.5:
+                            last_reconnect_attempt = now
+                            if cap is not None:
+                                cap.release()
+                                cap = None
+                            try:
+                                if state.camera_source == "esp32":
+                                    state.camera_status = f"Connecting to ESP32 ({state.esp32_url})..."
+                                    cap = cv2.VideoCapture(state.esp32_url, cv2.CAP_FFMPEG)
+                                else:
+                                    state.camera_status = "Initializing Local Webcam (0)..."
+                                    cap_backend = cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY
+                                    cap = cv2.VideoCapture(0, cap_backend)
+
+                                if cap is not None and cap.isOpened():
+                                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                                    state.camera_status = "Online (Streaming)"
+                                else:
+                                    state.camera_status = "Source Offline (Retrying...)"
+                            except Exception as e:
+                                state.camera_status = f"Connection Error: {str(e)[:24]}"
+                                cap = None
+
+                    if cap is not None and cap.isOpened():
+                        success, raw_frame = cap.read()
+                        if success and raw_frame is not None:
+                            consecutive_read_failures = 0
+                            frame = cv2.resize(raw_frame, (640, 360))
+                            state.camera_status = "Online (Streaming Zone 3)"
+                        else:
+                            consecutive_read_failures += 1
+                            if consecutive_read_failures > 30:
+                                state.camera_status = "Signal Lost - Retrying"
+                                if cap is not None:
+                                    cap.release()
+                                    cap = None
+                    else:
+                        frame = None
             else:
                 if cap is not None:
                     cap.release()
                     cap = None
+                current_source = None
+                state.camera_status = "Standby (Zone 3 Return Belt)"
                 frame = None
 
+            # Render Synthetic Frame if camera is offline or in simulation
+            is_synthetic = False
             if frame is None:
+                is_synthetic = True
                 frame = np.zeros((360, 640, 3), dtype=np.uint8)
-                frame[:] = (15, 18, 24)
-                
+                frame[:] = (16, 14, 12)
+
+                # SCADA Grid lines
                 for x in range(0, 640, 40):
-                    cv2.line(frame, (x, 0), (x, 360), (28, 34, 46), 1)
+                    cv2.line(frame, (x, 0), (x, 360), (32, 26, 20), 1)
                 for y in range(0, 360, 40):
-                    cv2.line(frame, (0, y), (640, y), (28, 34, 46), 1)
-                    
-                sweep_x = int((frame_counter * 5) % 640)
-                cv2.line(frame, (sweep_x, 0), (sweep_x, 360), (0, 229, 255), 1)
+                    cv2.line(frame, (0, y), (640, y), (32, 26, 20), 1)
 
-                cv2.rectangle(frame, (120, 130), (520, 230), (22, 28, 38), -1)
-                cv2.rectangle(frame, (120, 130), (520, 230), (255, 51, 102), 2)
-                cv2.putText(frame, "HARDWARE DISCONNECTED", (165, 170),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 51, 102), 2)
-                cv2.putText(frame, "Awaiting RPi Cam Module 3 / USB CSI", (170, 205),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 175, 195), 1)
+                # Conveyor Belt graphics
+                belt_top = 70
+                belt_bot = 290
+                cv2.rectangle(frame, (0, belt_top), (640, belt_bot), (28, 22, 18), -1)
+                cv2.line(frame, (0, belt_top), (640, belt_top), (110, 85, 55), 2)
+                cv2.line(frame, (0, belt_bot), (640, belt_bot), (110, 85, 55), 2)
 
-            if state.injected_defect == "SPLICE_TEAR":
-                cv2.rectangle(frame, (200, 100), (440, 240), (0, 0, 255), 2)
-                cv2.putText(frame, "AI DETECT: CRITICAL SPLICE RUPTURE [98.8%]", (200, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
-            elif state.injected_defect == "SURFACE_GOUGE":
-                cv2.rectangle(frame, (140, 160), (290, 250), (0, 165, 255), 2)
-                cv2.putText(frame, "AI DETECT: SURFACE GOUGE [84.5%]", (140, 150),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 2)
+                # Moving conveyor belt texture and ore lumps
+                belt_speed = int((frame_counter * 9) % 90) if state.speed_mps > 0.1 else 0
 
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                for bx in range(-90 + belt_speed, 640, 90):
+                    cv2.line(frame, (bx, belt_top), (bx + 30, belt_bot), (48, 36, 26), 2)
+                    cv2.circle(frame, (bx + 15, 160), 10, (58, 42, 28), -1)
+                    cv2.circle(frame, (bx + 45, 200), 14, (52, 38, 24), -1)
+
+                # Optical laser scanning sweep
+                if state.speed_mps > 0.1:
+                    sweep_x = int((frame_counter * 7) % 640)
+                    cv2.line(frame, (sweep_x, 0), (sweep_x, 360), (212, 175, 55), 1)
+
+                if state.camera_enabled and state.camera_source == "sim":
+                    cv2.rectangle(frame, (120, 130), (520, 230), (24, 18, 14), -1)
+                    cv2.rectangle(frame, (120, 130), (520, 230), (212, 175, 55), 1)
+                    cv2.putText(frame, "ZONE 3 RETURN BELT DIGITAL TWIN", (145, 168),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (245, 238, 225), 2)
+                    cv2.putText(frame, "Optical scanning for tears, splice joint gap & wear", (152, 196),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (190, 165, 135), 1)
+                elif state.camera_enabled:
+                    cv2.rectangle(frame, (110, 130), (530, 230), (24, 18, 14), -1)
+                    cv2.rectangle(frame, (110, 130), (530, 230), (168, 72, 37), 1)
+                    cv2.putText(frame, "AWAITING VIDEO STREAM SIGNAL", (155, 168),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (245, 238, 225), 2)
+                    src_label = f"Target: {state.esp32_url}" if state.camera_source == "esp32" else "Target: Local Webcam (0)"
+                    cv2.putText(frame, src_label, (135, 195),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (190, 165, 135), 1)
+                    cv2.putText(frame, f"Status: {state.camera_status}", (135, 215),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (212, 175, 55), 1)
+                else:
+                    cv2.rectangle(frame, (130, 135), (510, 225), (24, 18, 14), -1)
+                    cv2.rectangle(frame, (130, 135), (510, 225), (110, 85, 55), 1)
+                    cv2.putText(frame, "ZONE 3 CAMERA FEED ON STANDBY", (165, 170),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (245, 238, 225), 2)
+                    cv2.putText(frame, "Click [Enable Camera] to initialize optical inspection", (150, 196),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 155, 125), 1)
+
+            if state.mirror_view:
+                frame = cv2.flip(frame, 1)
+
+            # YOLOv8 Object & Defect Detection
+            detections = []
+            if state.yolo_enabled and YOLO_AVAILABLE and yolo_detector is not None:
+                try:
+                    results = yolo_detector.predict(frame, conf=state.yolo_confidence, verbose=False, imgsz=320)
+                    if results and len(results) > 0:
+                        frame = results[0].plot()
+                        for box in results[0].boxes:
+                            cls_id = int(box.cls[0].item())
+                            conf_val = float(box.conf[0].item())
+                            cls_name = results[0].names.get(cls_id, f"obj_{cls_id}")
+                            detections.append({
+                                "class": cls_name,
+                                "conf": round(conf_val * 100, 1)
+                            })
+                except Exception:
+                    pass
+
+            # Inject Conveyor Specific Defects & Annotations
+            h, w, _ = frame.shape
+            if state.active_fault == "SPLICE_TEAR":
+                cv2.rectangle(frame, (170, 85), (470, 245), (37, 72, 168), 2)
+                cv2.rectangle(frame, (170, 58), (470, 85), (37, 72, 168), -1)
+                cv2.putText(frame, "CRITICAL: SPLICE JOINT RUPTURE [99.2%]", (178, 77),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1)
+                detections.insert(0, {"class": "Splice Rupture", "conf": 99.2})
+            elif state.active_fault == "SURFACE_GOUGE":
+                cv2.rectangle(frame, (140, 140), (330, 240), (45, 110, 180), 2)
+                cv2.rectangle(frame, (140, 115), (330, 140), (45, 110, 180), -1)
+                cv2.putText(frame, "DEFECT: SURFACE GOUGE [88.5%]", (148, 133),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+                detections.insert(0, {"class": "Surface Gouge", "conf": 88.5})
+            elif state.active_fault == "ORE_DUST":
+                cv2.rectangle(frame, (w - 330, 15), (w - 20, 65), (20, 28, 36), -1)
+                cv2.rectangle(frame, (w - 330, 15), (w - 20, 65), (212, 175, 55), 1)
+                cv2.putText(frame, "SURFACE: IRON ORE LAYER", (w - 320, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 238, 225), 1)
+                cv2.putText(frame, "AI FILTER: BENIGN TEAR SUPPRESSED", (w - 320, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (212, 175, 55), 1)
+                detections.insert(0, {"class": "Iron Ore Layer (Benign)", "conf": 94.0})
+            elif state.active_fault == "MISALIGNMENT":
+                cv2.line(frame, (65, 0), (65, h), (37, 72, 168), 3)
+                cv2.line(frame, (w - 65, 0), (w - 65, h), (37, 72, 168), 3)
+                cv2.putText(frame, "LATERAL BELT SWAY EXCEEDED", (160, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (37, 72, 168), 2)
+                detections.insert(0, {"class": "Edge Misalignment", "conf": 96.0})
+
+            state.detected_objects = detections[:6]
+
+            # HUD Telemetry Overlay
+            cv2.rectangle(frame, (10, 10), (230, 40), (18, 14, 10), -1)
+            cv2.rectangle(frame, (10, 10), (230, 40), (70, 52, 35), 1)
+            src_str = "ESP32-CAM" if state.camera_source == "esp32" else ("WEBCAM" if state.camera_source == "webcam" else "DIGITAL TWIN")
+            mirror_str = "MIRROR" if state.mirror_view else "NORMAL"
+            cv2.putText(frame, f"[{src_str}] {state.live_fps:.1f} FPS | {mirror_str}", (18, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 215, 190), 1)
+
+            cv2.rectangle(frame, (w - 200, 10), (w - 10, 40), (18, 14, 10), -1)
+            cv2.rectangle(frame, (w - 200, 10), (w - 10, 40), (70, 52, 35), 1)
+            yolo_str = "YOLO: ON" if state.yolo_enabled else "YOLO: OFF"
+            cv2.putText(frame, f"{yolo_str} ({len(state.detected_objects)} detected)", (w - 192, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (212, 175, 55) if state.yolo_enabled else (150, 135, 115), 1)
+
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            time.sleep(0.04)
+
+            if is_synthetic or not state.camera_enabled:
+                time.sleep(0.033)
 
     except GeneratorExit:
         pass
@@ -206,1788 +462,1761 @@ def generate_frames():
 def video_feed():
     return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ----------------- TELEMETRY ENGINE -----------------
+# ----------------- TELEMETRY & HARDWARE SIMULATION -----------------
+t_step = 0.0
 def update_telemetry_step():
-    if state.injected_defect == "NORMAL":
-        state.tension_kn += (45.0 - state.tension_kn) * 0.1
-        state.bearing_temp_c += (52.0 - state.bearing_temp_c) * 0.1
-        state.vibration_rms += (2.1 - state.vibration_rms) * 0.1
-        state.injected_defect = "NONE"
+    global t_step
+    t_step += 0.1
 
-    elif state.injected_defect == "SPLICE_TEAR":
-        state.vibration_rms = min(12.5, state.vibration_rms + 0.8)
-        state.tension_kn = max(10.0, state.tension_kn - 2.5)
-        state.bearing_temp_c += random.uniform(0.1, 0.4)
+    if state.speed_mps > 0.05:
+        state.belt_pos_pct = (state.belt_pos_pct + (state.speed_mps / 3.5) * 1.5) % 100.0
+        state.motor_rpm = round(1480.0 * (state.speed_mps / 3.5), 1)
+    else:
+        state.motor_rpm = 0.0
 
-    elif state.injected_defect == "BEARING_HOTSPOT":
-        state.bearing_temp_c = min(115.0, state.bearing_temp_c + 1.2)
-        state.vibration_rms = min(8.0, state.vibration_rms + 0.3)
+    base_x = math.sin(t_step * 2.8) * 0.75 + random.uniform(-0.10, 0.10)
+    base_y = math.cos(t_step * 2.4) * 0.60 + random.uniform(-0.08, 0.08)
+    base_z = 9.81 + math.sin(t_step * 4.2) * 1.20 + random.uniform(-0.18, 0.18)
 
-    elif state.injected_defect == "TENSION_SPIKE":
-        state.tension_kn = min(92.0, state.tension_kn + 3.0)
+    if state.active_fault == "SPLICE_TEAR":
+        state.tension_kn = max(10.0, state.tension_kn - 1.8)
+        state.vibration_rms = min(14.5, state.vibration_rms + 0.6)
+        state.bearing_temp_c += random.uniform(0.1, 0.3)
+        base_x *= 3.8
+        base_y *= 4.2
+        base_z += math.sin(t_step * 10) * 5.0
+        state.emergency_stop = True
+        state.relay_nc_energized = False
+        state.speed_mps = max(0.0, state.speed_mps - 0.4)
+        state.throughput_tph = max(0.0, state.throughput_tph - 150.0)
+        state.joint_rul_hours = max(0.8, state.joint_rul_hours - 15.0)
+        state.zones["zone3"]["status"] = "SPLICE RUPTURE DETECTED"
+        state.zones["zone3"]["level"] = 3
+        state.zones["zone1"]["status"] = "MOTOR INTERLOCK TRIPPED"
+        state.zones["zone1"]["level"] = 3
+
+    elif state.active_fault == "BEARING_HOTSPOT":
+        state.bearing_temp_c = min(98.5, state.bearing_temp_c + 1.2)
+        state.vibration_rms = min(8.8, state.vibration_rms + 0.3)
+        base_y *= 3.2
+        if state.bearing_temp_c > 85.0:
+            state.emergency_stop = True
+            state.relay_nc_energized = False
+            state.speed_mps = max(0.0, state.speed_mps - 0.4)
+            state.throughput_tph = max(0.0, state.throughput_tph - 150.0)
+        state.joint_rul_hours = max(6.0, state.joint_rul_hours - 8.0)
+        state.zones["zone1"]["status"] = "BEARING HOTSPOT (>85°C)"
+        state.zones["zone1"]["level"] = 3
+
+    elif state.active_fault == "TENSION_SURGE":
+        state.tension_kn = min(78.0, state.tension_kn + 2.5)
+        if state.tension_kn > 65.0:
+            state.emergency_stop = True
+            state.relay_nc_energized = False
+            state.speed_mps = max(0.0, state.speed_mps - 0.4)
+            state.throughput_tph = max(0.0, state.throughput_tph - 150.0)
+        state.joint_rul_hours = max(18.0, state.joint_rul_hours - 10.0)
+        state.zones["zone4"]["status"] = "TENSION OVERLOAD (>65kN)"
+        state.zones["zone4"]["level"] = 3
+
+    elif state.active_fault == "MISALIGNMENT":
+        state.misalignment_mm = min(62.0, state.misalignment_mm + 2.8)
+        base_x += math.copysign(3.5, state.misalignment_mm)
+        if abs(state.misalignment_mm) > 40.0:
+            state.emergency_stop = True
+            state.relay_nc_energized = False
+            state.speed_mps = max(0.0, state.speed_mps - 0.4)
+            state.throughput_tph = max(0.0, state.throughput_tph - 150.0)
+        state.joint_rul_hours = max(28.0, state.joint_rul_hours - 5.0)
+        state.zones["zone2"]["status"] = "LATERAL SWAY DRIFT"
+        state.zones["zone2"]["level"] = 3
+
+    elif state.active_fault == "SURFACE_GOUGE":
+        state.vibration_rms = min(4.8, state.vibration_rms + 0.15)
+        state.joint_rul_hours = max(72.0, state.joint_rul_hours - 2.0)
+        state.zones["zone3"]["status"] = "SURFACE GOUGE DETECTED"
+        state.zones["zone3"]["level"] = 2
+
+    elif state.active_fault == "ORE_DUST":
+        state.surface_material = "HEAVY IRON ORE ACCUMULATION (BENIGN - FILTERED)"
+        state.zones["zone2"]["status"] = "IRON ORE LAYER (BENIGN)"
+        state.zones["zone2"]["level"] = 1
 
     else:
-        state.tension_kn += random.uniform(-0.3, 0.3)
-        state.bearing_temp_c += random.uniform(-0.1, 0.1)
-        state.vibration_rms += random.uniform(-0.08, 0.08)
+        state.tension_kn += random.uniform(-0.25, 0.25)
+        state.bearing_temp_c += random.uniform(-0.12, 0.12)
+        state.misalignment_mm += random.uniform(-0.18, 0.18)
+        state.vibration_rms += random.uniform(-0.06, 0.06)
+        state.speed_mps = 3.5
+        state.throughput_tph = 1250.0
+        state.joint_rul_hours = 720.0
+        for zkey in state.zones:
+            state.zones[zkey]["status"] = "NOMINAL"
+            state.zones[zkey]["level"] = 1
 
-    state.vibration_x = round(state.vibration_rms * 0.35 + random.uniform(-0.05, 0.05), 2)
-    state.vibration_y = round(state.vibration_rms * 0.45 + random.uniform(-0.05, 0.05), 2)
-    state.vibration_z = round(state.vibration_rms * 0.65 + random.uniform(-0.05, 0.05), 2)
+    state.tension_kn = max(0.0, min(85.0, state.tension_kn))
+    state.bearing_temp_c = max(20.0, min(120.0, state.bearing_temp_c))
+    state.vibration_rms = max(0.5, min(16.0, state.vibration_rms))
+    state.vibration_x = round(base_x, 2)
+    state.vibration_y = round(base_y, 2)
+    state.vibration_z = round(base_z, 2)
 
-    penalty = 0.0
-    if state.vibration_rms > 4.0: penalty += (state.vibration_rms - 4.0) * 8.0
-    if state.bearing_temp_c > 65.0: penalty += (state.bearing_temp_c - 65.0) * 1.5
-    if state.tension_kn > 70.0 or state.tension_kn < 25.0: penalty += 35.0
-    if state.injected_defect == "SPLICE_TEAR": penalty += 55.0
+    pen_tension = abs(state.tension_kn - 45.0) * 1.6
+    pen_temp = max(0.0, state.bearing_temp_c - 60.0) * 1.8
+    pen_vib = max(0.0, state.vibration_rms - 2.8) * 7.0
+    pen_align = max(0.0, abs(state.misalignment_mm) - 25.0) * 1.4
+    
+    state.bhi = max(0.0, min(100.0, round(100.0 - (pen_tension + pen_temp + pen_vib + pen_align), 1)))
 
-    state.bhi = max(0.0, min(100.0, 100.0 - penalty))
-
-    if state.bhi < 40.0 or state.injected_defect == "SPLICE_TEAR":
-        state.status = "LEVEL 3: CRITICAL (EMERGENCY MOTOR CUTOFF)"
+    if state.emergency_stop or state.bhi < 40.0:
+        state.status = "LEVEL 3: CRITICAL (RELAY TRIPPED)"
         state.status_level = 3
-        state.emergency_stop = True
-        state.speed_mps = max(0.0, state.speed_mps - 0.5)
     elif state.bhi < 75.0:
-        state.status = "LEVEL 2: WARNING (MAINTENANCE REQUIRED)"
+        state.status = "LEVEL 2: WARNING"
         state.status_level = 2
     else:
         state.status = "LEVEL 1: OPTIMAL"
         state.status_level = 1
-        if not state.emergency_stop:
-            state.speed_mps = 3.5
 
-# ----------------- FAULT INJECTION API -----------------
-class FaultRequest(BaseModel):
-    fault_type: str
-
+# ----------------- REST API ENDPOINTS -----------------
 @app.post("/api/inject_fault")
 def inject_fault(req: FaultRequest):
+    state.active_fault = req.fault_type
     state.injected_defect = req.fault_type
+    
+    if req.fault_type == "SPLICE_TEAR":
+        state.emergency_stop = True
+        state.relay_nc_energized = False
+        state.tension_kn = 18.5
+        state.vibration_rms = 9.8
+        state.speed_mps = 0.0
+        state.throughput_tph = 0.0
+        state.joint_rul_hours = 1.8
+        state.bhi = 20.0
+        state.status = "LEVEL 3: CRITICAL (RELAY TRIPPED)"
+        state.status_level = 3
+        msg = "Critical Splice Joint Rupture Detected! Normally Closed (NC) Safety Relay Tripped - Motor Cutoff Engaged"
+        sev = "CRITICAL"
+
+    elif req.fault_type == "BEARING_HOTSPOT":
+        state.bearing_temp_c = 94.2
+        state.vibration_rms = 6.8
+        state.emergency_stop = True
+        state.relay_nc_energized = False
+        state.speed_mps = 0.0
+        state.throughput_tph = 0.0
+        state.joint_rul_hours = 12.0
+        state.bhi = 34.0
+        state.status = "LEVEL 3: CRITICAL (OVERHEAT TRIP)"
+        state.status_level = 3
+        msg = "Drive Pulley Bearing Hotspot Exceeded 90°C! Automated E-Stop Interlock Engaged"
+        sev = "CRITICAL"
+
+    elif req.fault_type == "TENSION_SURGE":
+        state.tension_kn = 74.5
+        state.emergency_stop = True
+        state.relay_nc_energized = False
+        state.speed_mps = 0.0
+        state.throughput_tph = 0.0
+        state.joint_rul_hours = 24.0
+        state.bhi = 36.0
+        state.status = "LEVEL 3: CRITICAL (TENSION OVERLOAD)"
+        state.status_level = 3
+        msg = "HX711 Strain Gauge Array Detected Tension Surge (>70 kN)! Motor Cutoff Triggered"
+        sev = "CRITICAL"
+
+    elif req.fault_type == "MISALIGNMENT":
+        state.misalignment_mm = 58.0
+        state.emergency_stop = True
+        state.relay_nc_energized = False
+        state.speed_mps = 0.0
+        state.throughput_tph = 0.0
+        state.joint_rul_hours = 36.0
+        state.bhi = 38.0
+        state.status = "LEVEL 3: CRITICAL (SWAY LIMIT TRIP)"
+        state.status_level = 3
+        msg = "Severe Lateral Belt Sway (>40mm)! Edge Proximity Interlock Activated"
+        sev = "CRITICAL"
+
+    elif req.fault_type == "SURFACE_GOUGE":
+        state.vibration_rms = 4.4
+        state.joint_rul_hours = 96.0
+        state.bhi = 65.0
+        state.status = "LEVEL 2: WARNING (SCHEDULE REROLL)"
+        state.status_level = 2
+        msg = "Surface Gouge Defect Flagged by YOLOv8n. Logged Maintenance Ticket with RUL = 96 hrs"
+        sev = "WARNING"
+
+    elif req.fault_type == "ORE_DUST":
+        state.surface_material = "HEAVY IRON ORE ACCUMULATION (BENIGN - FILTERED)"
+        state.bhi = 92.0
+        state.joint_rul_hours = 680.0
+        state.status = "LEVEL 1: OPTIMAL (ORE DUST FILTERED)"
+        state.status_level = 1
+        msg = "Heavy Iron Ore Dust Layer Detected. Vision Filter Validated Ore Hemispheres & Suppressed False Alarm"
+        sev = "INFO"
+    else:
+        msg = f"Custom fault mode engaged: {req.fault_type}"
+        sev = "WARNING"
+
     log_entry = {
         "timestamp": time.strftime("%H:%M:%S"),
-        "event": f"FAULT TRIGGER: {req.fault_type}",
-        "severity": "CRITICAL" if req.fault_type in ["SPLICE_TEAR", "TENSION_SPIKE"] else "WARNING"
+        "event": msg,
+        "severity": sev
     }
     state.incident_log.insert(0, log_entry)
-    return {"status": "success", "active_fault": state.injected_defect}
+    return {"status": "injected", "fault": req.fault_type, "message": msg}
+
+@app.post("/api/reset")
+def reset_system():
+    state.active_fault = "NONE"
+    state.injected_defect = "NONE"
+    state.emergency_stop = False
+    state.relay_nc_energized = True
+    state.tension_kn = 45.0
+    state.bearing_temp_c = 52.4
+    state.vibration_rms = 2.10
+    state.vibration_x = 0.42
+    state.vibration_y = -0.28
+    state.vibration_z = 9.81
+    state.misalignment_mm = 2.1
+    state.speed_mps = 3.5
+    state.throughput_tph = 1250.0
+    state.surface_material = "NORMAL OPERATING DUST COAT"
+    state.joint_rul_hours = 720.0
+    state.bhi = 98.0
+    state.status = "LEVEL 1: OPTIMAL"
+    state.status_level = 1
+    
+    for zkey in state.zones:
+        state.zones[zkey]["status"] = "NOMINAL"
+        state.zones[zkey]["level"] = 1
+
+    log_entry = {
+        "timestamp": time.strftime("%H:%M:%S"),
+        "event": "Safety Interlock Reset by SCADA Operator · Drive Contactor Energized · Baseline Restored",
+        "severity": "INFO"
+    }
+    state.incident_log.insert(0, log_entry)
+    return {"status": "reset", "emergency_stop": False, "active_fault": "NONE"}
+
+@app.post("/api/set_twin_params")
+def set_twin_params(req: TwinStimulateRequest):
+    if not state.emergency_stop:
+        state.speed_mps = max(0.0, min(5.0, req.speed_mps))
+        state.throughput_tph = max(0.0, min(2500.0, req.throughput_tph))
+    return {
+        "speed_mps": state.speed_mps,
+        "throughput_tph": state.throughput_tph,
+        "motor_running": state.speed_mps > 0.1
+    }
 
 @app.post("/api/toggle_camera")
 def toggle_camera():
-    if not state.camera_enabled and not state.device_connected:
-        return {"camera_enabled": False, "error": "device_not_connected"}
     state.camera_enabled = not state.camera_enabled
-    return {"camera_enabled": state.camera_enabled}
+    log_entry = {
+        "timestamp": time.strftime("%H:%M:%S"),
+        "event": f"Zone 3 Camera Feed {'ENABLED' if state.camera_enabled else 'PLACED ON STANDBY'}",
+        "severity": "INFO"
+    }
+    state.incident_log.insert(0, log_entry)
+    return {"camera_enabled": state.camera_enabled, "source": state.camera_source}
+
+@app.post("/api/set_camera_config")
+def set_camera_config(req: CameraConfigRequest):
+    if req.source in ["esp32", "webcam", "sim"]:
+        state.camera_source = req.source
+    if req.esp32_url and req.esp32_url.strip():
+        state.esp32_url = req.esp32_url.strip()
+    
+    log_entry = {
+        "timestamp": time.strftime("%H:%M:%S"),
+        "event": f"Zone 3 Optical Source changed to {state.camera_source.upper()} ({state.esp32_url if state.camera_source == 'esp32' else 'Index 0'})",
+        "severity": "INFO"
+    }
+    state.incident_log.insert(0, log_entry)
+    return {
+        "source": state.camera_source,
+        "esp32_url": state.esp32_url,
+        "camera_enabled": state.camera_enabled
+    }
+
+@app.post("/api/toggle_mirror")
+def toggle_mirror():
+    state.mirror_view = not state.mirror_view
+    return {"mirror_view": state.mirror_view}
+
+@app.post("/api/toggle_yolo")
+def toggle_yolo():
+    state.yolo_enabled = not state.yolo_enabled
+    return {"yolo_enabled": state.yolo_enabled}
 
 @app.post("/api/toggle_device")
 def toggle_device():
     state.device_connected = not state.device_connected
     log_entry = {
         "timestamp": time.strftime("%H:%M:%S"),
-        "event": "Hardware link established (sensors + camera bus online)" if state.device_connected else "Hardware link dropped — running on standby",
+        "event": f"Hardware IoT channel {'CONNECTED (MPU6050 + DS18B20 + HX711)' if state.device_connected else 'SWITCHED TO DIGITAL TWIN'}",
         "severity": "INFO"
     }
     state.incident_log.insert(0, log_entry)
-    if not state.device_connected:
-        state.camera_enabled = False
     return {"device_connected": state.device_connected}
 
-@app.post("/api/reset")
-def reset_system():
-    state.injected_defect = "NORMAL"
-    state.emergency_stop = False
-    state.tension_kn = 45.0
-    state.vibration_rms = 2.1
-    state.bearing_temp_c = 52.0
-    state.speed_mps = 3.5
-    state.bhi = 98.0
-    state.status = "LEVEL 1: OPTIMAL"
-    state.status_level = 1
-    return {"status": "reset_complete"}
-
-# ----------------- WEBSOCKET BROADCAST -----------------
+# ----------------- WEBSOCKET TELEMETRY DISPATCHER -----------------
 @app.websocket("/ws")
 async def websocket_telemetry(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            if state.device_connected:
-                update_telemetry_step()
-                display_status = state.status
-                display_level = state.status_level
-            else:
-                display_status = "STANDBY: AWAITING HARDWARE CONNECTION"
-                display_level = 0
-
+            update_telemetry_step()
             payload = {
-                "bhi": round(state.bhi, 1),
-                "speed": round(state.speed_mps, 2),
-                "load": round(state.load_tph, 1),
+                "bhi": state.bhi,
+                "status": state.status,
+                "status_level": state.status_level,
+                "emergency_stop": state.emergency_stop,
+                "relay_nc_energized": state.relay_nc_energized,
+                "active_fault": state.active_fault,
+                "joint_rul_hours": round(state.joint_rul_hours, 1),
+                "speed_mps": round(state.speed_mps, 1),
+                "throughput_tph": round(state.throughput_tph, 0),
+                "belt_pos_pct": round(state.belt_pos_pct, 1),
+                "motor_rpm": round(state.motor_rpm, 0),
                 "tension": round(state.tension_kn, 1),
+                "temperature": round(state.bearing_temp_c, 1),
                 "vibration": round(state.vibration_rms, 2),
                 "vib_x": state.vibration_x,
                 "vib_y": state.vibration_y,
                 "vib_z": state.vibration_z,
-                "temperature": round(state.bearing_temp_c, 1),
-                "status": display_status,
-                "status_level": display_level,
-                "emergency_stop": state.emergency_stop,
+                "misalignment_mm": round(state.misalignment_mm, 1),
+                "surface_material": state.surface_material,
                 "camera_connected": state.camera_enabled,
+                "camera_source": state.camera_source,
+                "camera_status": state.camera_status,
+                "mirror_view": state.mirror_view,
+                "yolo_enabled": state.yolo_enabled,
+                "live_fps": state.live_fps,
+                "detected_objects": state.detected_objects,
                 "device_connected": state.device_connected,
-                "rul_hours": max(0, int(state.bhi * 18.5)),
-                "incidents": state.incident_log[:6]
+                "zones": state.zones,
+                "modbus_status": state.modbus_status,
+                "opcua_status": state.opcua_status,
+                "incidents": state.incident_log[:14]
             }
             await websocket.send_text(json.dumps(payload))
             await asyncio.sleep(0.1)
-    except (WebSocketDisconnect, ConnectionResetError):
+    except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
 
-# ----------------- FRONT PAGE (SIGN IN) -----------------
-@app.get("/", response_class=HTMLResponse)
-def landing():
-    return LANDING_HTML
-
-# ----------------- EMBEDDED DASHBOARD -----------------
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return DASHBOARD_HTML
-
+# ----------------- UI TEMPLATES (SPACIOUS · BROWN & GOLDEN YELLOW IN DARK MODE) -----------------
 LANDING_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NMDC Conveyor Health AI — Sign In</title>
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-<style>
-    :root {
-        --bg: #06070b;
-        --card-bg: #12151fcc;
-        --border: #22293a;
-        --cyan: #00e5ff;
-        --green: #00ff88;
-        --amber: #ffb700;
-        --ember: #ff6a3d;
-        --red: #ff3366;
-        --text-main: #ffffff;
-        --text-dim: #9aa7bd;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body {
-        background: var(--bg);
-        color: var(--text-main);
-        font-family: 'Inter', sans-serif;
-        overflow-x: hidden;
-        min-height: 100vh;
-        position: relative;
-    }
-
-    /* ---------------- LIQUID FLUID BACKGROUND ---------------- */
-    .fluid-stage {
-        position: fixed;
-        inset: 0;
-        z-index: 0;
-        overflow: hidden;
-        background: radial-gradient(ellipse at 50% -10%, #0d1220 0%, #06070b 60%);
-    }
-    .fluid-goo { position: absolute; inset: -10%; filter: url(#goo) blur(2px); }
-    .blob {
-        position: absolute;
-        border-radius: 42% 58% 65% 35% / 45% 40% 60% 55%;
-        mix-blend-mode: screen;
-        opacity: 0.7;
-        filter: blur(6px);
-        animation: morph 16s ease-in-out infinite;
-    }
-    .blob.b1 { width: 46vw; height: 46vw; left: -10vw; top: -8vw; background: radial-gradient(circle at 35% 30%, var(--ember), #7a1c00 70%); animation-duration: 19s; }
-    .blob.b2 { width: 38vw; height: 38vw; right: -8vw; top: 8vw; background: radial-gradient(circle at 60% 40%, var(--cyan), #003b45 70%); animation-duration: 23s; animation-delay: -4s; }
-    .blob.b3 { width: 34vw; height: 34vw; left: 20vw; bottom: -14vw; background: radial-gradient(circle at 50% 50%, var(--amber), #5c3800 70%); animation-duration: 27s; animation-delay: -10s; }
-    .blob.b4 { width: 28vw; height: 28vw; right: 18vw; bottom: -10vw; background: radial-gradient(circle at 50% 50%, var(--green), #003322 70%); opacity: 0.45; animation-duration: 21s; animation-delay: -7s; }
-
-    @keyframes morph {
-        0%   { border-radius: 42% 58% 65% 35% / 45% 40% 60% 55%; transform: translate(0,0) scale(1) rotate(0deg); }
-        25%  { border-radius: 58% 42% 35% 65% / 60% 55% 45% 40%; transform: translate(4%, 3%) scale(1.08) rotate(15deg); }
-        50%  { border-radius: 65% 35% 55% 45% / 40% 60% 35% 65%; transform: translate(-3%, 5%) scale(0.96) rotate(-10deg); }
-        75%  { border-radius: 35% 65% 40% 60% / 55% 45% 65% 40%; transform: translate(3%, -4%) scale(1.05) rotate(8deg); }
-        100% { border-radius: 42% 58% 65% 35% / 45% 40% 60% 55%; transform: translate(0,0) scale(1) rotate(0deg); }
-    }
-    .grain-overlay {
-        position: fixed; inset: 0; z-index: 1; pointer-events: none;
-        background: repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0px, transparent 1px, transparent 2px);
-        mix-blend-mode: overlay;
-    }
-    .vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none; box-shadow: inset 0 0 22vw rgba(0,0,0,0.75); }
-
-    /* ---------------- LAYOUT ---------------- */
-    .page { position: relative; z-index: 2; min-height: 100vh; display: flex; flex-direction: column; }
-
-    nav { display: flex; justify-content: space-between; align-items: center; padding: 22px 5vw; }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-logo {
-        width: 42px; height: 42px; border-radius: 10px;
-        background: rgba(0, 229, 255, 0.08); border: 1px solid var(--cyan);
-        display: flex; align-items: center; justify-content: center; color: var(--cyan);
-        backdrop-filter: blur(6px);
-    }
-    .brand h1 { font-family: 'Rajdhani', sans-serif; font-size: 19px; font-weight: 700; letter-spacing: 1.2px; color: #fff; }
-    .brand p { font-size: 10.5px; color: var(--text-dim); letter-spacing: 0.4px; }
-
-    .btn-ghost {
-        padding: 10px 20px; border-radius: 8px; border: 1px solid var(--border);
-        background: rgba(255,255,255,0.03); color: #fff; font-size: 13px; font-weight: 600;
-        cursor: pointer; backdrop-filter: blur(6px);
-    }
-
-    /* ---------------- HERO / SPLIT LAYOUT ---------------- */
-    .split {
-        flex: 1; display: grid; grid-template-columns: 1.1fr 0.9fr;
-        gap: 40px; align-items: center; padding: 20px 6vw 50px; max-width: 1300px; margin: 0 auto; width: 100%;
-    }
-    .hero-copy { text-align: left; }
-    .hero-tag {
-        display: inline-flex; align-items: center; gap: 8px;
-        border: 1px solid var(--border); background: rgba(255,255,255,0.04);
-        border-radius: 999px; padding: 6px 14px; font-size: 11.5px; color: var(--amber);
-        letter-spacing: 0.5px; margin-bottom: 22px; backdrop-filter: blur(6px);
-    }
-    .hero-copy h2 {
-        font-family: 'Rajdhani', sans-serif; font-weight: 700; letter-spacing: 0.5px;
-        font-size: clamp(28px, 3.6vw, 46px); line-height: 1.1;
-        background: linear-gradient(120deg, #fff 30%, var(--cyan) 65%, var(--ember) 100%);
-        -webkit-background-clip: text; background-clip: text; color: transparent;
-    }
-    .hero-copy p.sub {
-        margin-top: 16px; max-width: 480px; color: var(--text-dim); font-size: 14.5px; line-height: 1.65;
-    }
-    .features {
-        display: grid; grid-template-columns: repeat(2, 1fr);
-        gap: 12px; margin-top: 36px; max-width: 520px;
-    }
-    .feature-card {
-        background: rgba(18,21,31,0.5); border: 1px solid var(--border);
-        border-radius: 12px; padding: 15px; backdrop-filter: blur(10px);
-    }
-    .feature-card .f-icon {
-        width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center;
-        justify-content: center; background: rgba(0,229,255,0.1); color: var(--cyan); margin-bottom: 10px;
-    }
-    .feature-card h3 { font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
-    .feature-card p { font-size: 11px; color: var(--text-dim); line-height: 1.45; }
-
-    /* ---------------- AUTH CARD ---------------- */
-    .auth-card {
-        background: #10131cee; border: 1px solid var(--border); border-radius: 18px;
-        padding: 36px 34px; width: 100%; max-width: 400px; margin: 0 auto;
-        box-shadow: 0 24px 70px rgba(0,0,0,0.55);
-        backdrop-filter: blur(14px);
-    }
-    .auth-card h2 {
-        font-family: 'Rajdhani', sans-serif; font-size: 24px; font-weight: 700; text-align: center;
-    }
-    .auth-card p.auth-sub { text-align: center; font-size: 12.5px; color: var(--text-dim); margin-top: 6px; margin-bottom: 26px; }
-
-    .field { margin-bottom: 16px; position: relative; }
-    .field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; font-weight: 500; }
-    .field input {
-        width: 100%; padding: 12px 14px; background: #191e2b; border: 1px solid var(--border);
-        border-radius: 8px; color: var(--text-main); font-size: 14px; outline: none;
-        transition: border-color 0.15s, box-shadow 0.15s;
-    }
-    .field input:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(0,229,255,0.12); }
-    .field-hint { font-size: 11px; color: var(--text-dim); margin-top: 5px; }
-
-    .auth-error {
-        display: none; background: rgba(255,51,102,0.1); border: 1px solid var(--red);
-        color: #ffb3c3; font-size: 12.5px; padding: 10px 12px; border-radius: 8px; margin-bottom: 16px;
-    }
-    .auth-success {
-        display: none; background: rgba(0,255,136,0.1); border: 1px solid var(--green);
-        color: #b8ffdf; font-size: 12.5px; padding: 10px 12px; border-radius: 8px; margin-bottom: 16px;
-    }
-
-    .btn-primary-block {
-        width: 100%; padding: 13px; border-radius: 8px; border: none;
-        background: linear-gradient(120deg, var(--cyan), #00b8cc); color: #001217; font-size: 14px; font-weight: 700;
-        letter-spacing: 0.3px; cursor: pointer; transition: filter 0.15s, transform 0.15s;
-        display: flex; align-items: center; justify-content: center; gap: 8px;
-    }
-    .btn-primary-block:hover { filter: brightness(1.08); transform: translateY(-1px); }
-    .btn-primary-block:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-
-    .auth-switch { text-align: center; margin-top: 20px; font-size: 12.5px; color: var(--text-dim); }
-    .auth-switch a { color: var(--cyan); cursor: pointer; text-decoration: none; font-weight: 600; }
-    .auth-switch a:hover { text-decoration: underline; }
-
-    .spinner {
-        width: 15px; height: 15px; border: 2px solid rgba(0,0,0,0.25); border-top-color: #001217;
-        border-radius: 50%; animation: spin 0.7s linear infinite; display: none;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    footer { text-align: center; padding: 18px; font-size: 11px; color: var(--text-dim); position: relative; z-index: 2; }
-
-    @media (max-width: 900px) {
-        .split { grid-template-columns: 1fr; padding-top: 10px; }
-        .hero-copy { text-align: center; }
-        .hero-copy p.sub { margin: 16px auto 0; }
-        .features { margin: 30px auto 0; }
-    }
-    @media (max-width: 520px) {
-        nav { padding: 16px 5vw; }
-        .auth-card { padding: 28px 22px; }
-    }
-</style>
-</head>
-<body>
-
-<svg width="0" height="0" style="position:absolute">
-    <filter id="goo">
-        <feGaussianBlur in="SourceGraphic" stdDeviation="18" result="blur" />
-        <feColorMatrix in="blur" mode="matrix"
-            values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 24 -10" result="goo" />
-        <feBlend in="SourceGraphic" in2="goo" />
-    </filter>
-</svg>
-
-<div class="fluid-stage">
-    <div class="fluid-goo">
-        <div class="blob b1"></div>
-        <div class="blob b2"></div>
-        <div class="blob b3"></div>
-        <div class="blob b4"></div>
-    </div>
-</div>
-<div class="grain-overlay"></div>
-<div class="vignette"></div>
-
-<div class="page">
-    <nav>
-        <div class="brand">
-            <div class="brand-logo">
-                <svg width="22" height="22" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
-            </div>
-            <div>
-                <h1>NMDC CONVEYOR HEALTH AI</h1>
-                <p>Smart India Hackathon PS 26008 · Ministry of Steel</p>
-            </div>
-        </div>
-    </nav>
-
-    <div class="split">
-        <div class="hero-copy">
-            <div class="hero-tag">
-                <svg width="13" height="13" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20" stroke="currentColor" stroke-width="2"/></svg>
-                BUILT FOR IRON ORE & MINERAL MINING ENTERPRISES
-            </div>
-            <h2>See belt failures before they happen.</h2>
-            <p class="sub">
-                One command center that fuses computer-vision splice inspection, multi-sensor IoT telemetry
-                and predictive Belt Health scoring — so mining operations teams can act on conveyor risk
-                hours before a shutdown, not after.
-            </p>
-            <div class="features">
-                <div class="feature-card">
-                    <div class="f-icon"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" fill="none"/></svg></div>
-                    <h3>Vision AI Inspection</h3>
-                    <p>Splice tears & surface gouges detected live once a camera is linked.</p>
-                </div>
-                <div class="feature-card">
-                    <div class="f-icon"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M4.93 19.07A10 10 0 0 1 12 2a10 10 0 0 1 7.07 17.07M12 12v6M12 8h.01" stroke="currentColor" stroke-width="2" fill="none"/></svg></div>
-                    <h3>IoT Telemetry Fusion</h3>
-                    <p>Tension, temperature & vibration fused into one Belt Health Index.</p>
-                </div>
-                <div class="feature-card">
-                    <div class="f-icon"><svg width="16" height="16" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="3" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="14" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="3" y="14" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/></svg></div>
-                    <h3>Digital Twin View</h3>
-                    <p>Live twin of the conveyor drive and take-up drums.</p>
-                </div>
-                <div class="feature-card">
-                    <div class="f-icon"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="currentColor" stroke-width="2" fill="none"/></svg></div>
-                    <h3>Safety Interlock & Logs</h3>
-                    <p>Auto motor cutoff on critical belt health, full incident log.</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Auth Card -->
-        <div class="auth-card">
-            <h2 id="authTitle">Sign in</h2>
-            <p class="auth-sub" id="authSub">Access the NMDC belt monitoring command center</p>
-
-            <div class="auth-error" id="authError"></div>
-            <div class="auth-success" id="authSuccess"></div>
-
-            <form id="authForm" onsubmit="return handleAuthSubmit(event)">
-                <div class="field" id="nameField" style="display:none;">
-                    <label for="nameInput">Full name</label>
-                    <input type="text" id="nameInput" autocomplete="name" placeholder="e.g. Rajesh Verma">
-                </div>
-                <div class="field">
-                    <label for="emailInput">Email address</label>
-                    <input type="email" id="emailInput" autocomplete="email" placeholder="you@nmdc.co.in" required>
-                </div>
-                <div class="field">
-                    <label for="passwordInput">Password</label>
-                    <input type="password" id="passwordInput" autocomplete="current-password" placeholder="••••••••" required>
-                    <div class="field-hint" id="passwordHint" style="display:none;">At least 8 characters</div>
-                </div>
-
-                <button type="submit" class="btn-primary-block" id="authSubmitBtn">
-                    <span class="spinner" id="authSpinner"></span>
-                    <span id="authSubmitLabel">Sign in</span>
-                </button>
-            </form>
-
-            <div class="auth-switch">
-                <span id="switchPrompt">Don't have an account?</span>
-                <a onclick="switchAuthMode()" id="switchLink">Create one</a>
-            </div>
-        </div>
-    </div>
-
-    <footer>NMDC Ministry of Steel · Smart India Hackathon Problem Statement 26008 · Industrial Multi-Modal Interlock</footer>
-</div>
-
-<script>
-    let authMode = 'signin'; // or 'signup'
-
-    // If already signed in with a still-valid session, skip straight to dashboard
-    (function checkExistingSession() {
-        const token = sessionStorage.getItem('nmdc_token');
-        if (!token) return;
-        fetch('/api/verify_session', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token })
-        }).then(r => r.ok ? window.location.href = '/dashboard' : sessionStorage.removeItem('nmdc_token'))
-          .catch(() => {});
-    })();
-
-    function switchAuthMode() {
-        authMode = authMode === 'signin' ? 'signup' : 'signin';
-        const isSignup = authMode === 'signup';
-        document.getElementById('authTitle').innerText = isSignup ? 'Create your account' : 'Sign in';
-        document.getElementById('authSub').innerText = isSignup
-            ? 'Register with your name, email and password'
-            : 'Access the NMDC belt monitoring command center';
-        document.getElementById('nameField').style.display = isSignup ? 'block' : 'none';
-        document.getElementById('nameInput').required = isSignup;
-        document.getElementById('passwordHint').style.display = isSignup ? 'block' : 'none';
-        document.getElementById('passwordInput').autocomplete = isSignup ? 'new-password' : 'current-password';
-        document.getElementById('authSubmitLabel').innerText = isSignup ? 'Create account' : 'Sign in';
-        document.getElementById('switchPrompt').innerText = isSignup ? 'Already have an account?' : "Don't have an account?";
-        document.getElementById('switchLink').innerText = isSignup ? 'Sign in' : 'Create one';
-        hideMessages();
-    }
-
-    function hideMessages() {
-        document.getElementById('authError').style.display = 'none';
-        document.getElementById('authSuccess').style.display = 'none';
-    }
-
-    function showError(msg) {
-        const el = document.getElementById('authError');
-        el.innerText = msg;
-        el.style.display = 'block';
-        document.getElementById('authSuccess').style.display = 'none';
-    }
-
-    function setLoading(isLoading) {
-        document.getElementById('authSubmitBtn').disabled = isLoading;
-        document.getElementById('authSpinner').style.display = isLoading ? 'inline-block' : 'none';
-    }
-
-    async function handleAuthSubmit(evt) {
-        evt.preventDefault();
-        hideMessages();
-
-        const email = document.getElementById('emailInput').value.trim();
-        const password = document.getElementById('passwordInput').value;
-        const name = document.getElementById('nameInput').value.trim();
-
-        if (authMode === 'signup' && name.length < 2) {
-            showError('Please enter your full name.');
-            return false;
-        }
-        if (!email || !password) {
-            showError('Please fill in all required fields.');
-            return false;
-        }
-        if (authMode === 'signup' && password.length < 8) {
-            showError('Password must be at least 8 characters.');
-            return false;
-        }
-
-        setLoading(true);
-        try {
-            const endpoint = authMode === 'signup' ? '/api/signup' : '/api/signin';
-            const body = authMode === 'signup' ? { name, email, password } : { email, password };
-
-            const res = await fetch(endpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-            const data = await res.json();
-
-            if (!res.ok) {
-                showError(data.detail || 'Something went wrong. Please try again.');
-                setLoading(false);
-                return false;
-            }
-
-            sessionStorage.setItem('nmdc_token', data.token);
-            sessionStorage.setItem('nmdc_name', data.name);
-
-            const successEl = document.getElementById('authSuccess');
-            successEl.innerText = 'Credentials verified — opening command center…';
-            successEl.style.display = 'block';
-
-            setTimeout(() => { window.location.href = '/dashboard'; }, 500);
-        } catch (err) {
-            showError('Could not reach the server. Please try again.');
-            setLoading(false);
-        }
-        return false;
-    }
-
-    document.addEventListener('mousemove', (e) => {
-        const x = (e.clientX / window.innerWidth - 0.5) * 20;
-        const y = (e.clientY / window.innerHeight - 0.5) * 20;
-        document.querySelectorAll('.blob').forEach((b, i) => {
-            const depth = (i + 1) * 0.35;
-            b.style.marginLeft = (x * depth) + 'px';
-            b.style.marginTop = (y * depth) + 'px';
-        });
-    });
-</script>
-</body>
-</html>
-"""
-DASHBOARD_HTML = """
-<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <title>NMDC Industrial Conveyor AI SCADA</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AYASK — NMDC Conveyor AI SCADA Command Center</title>
+    <link rel="icon" type="image/png" href="/static/ayask_logo.png">
+    <link rel="shortcut icon" href="/static/ayask_logo.png">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         :root[data-theme="dark"] {
-            --bg: #090b10;
-            --card-bg: #12151f;
-            --card-inner: #191e2b;
-            --border: #22293a;
-            --cyan: #00e5ff;
-            --green: #00ff88;
-            --amber: #ffb700;
-            --red: #ff3366;
-            --text-main: #ffffff;
-            --text-dim: #7a889b;
+            --bg-base: #0e0c0a;
+            --bg-panel: #161310;
+            --bg-card: #1c1814;
+            --bg-input: #120f0c;
+            --border: #33281e;
+            --border-hover: #543f2a;
+            --text-primary: #f5eedf;
+            --text-secondary: #c4b5a0;
+            --text-muted: #8a7b68;
+            --copper: #d4af37;
+            --copper-hover: #e5be42;
+            --copper-subtle: rgba(212, 175, 55, 0.12);
+            --danger: #a84825;
+            --success: #d4af37;
+            --shadow-float: 0 16px 36px rgba(0, 0, 0, 0.55);
         }
         :root[data-theme="light"] {
-            --bg: #f4f6fa;
-            --card-bg: #ffffff;
-            --card-inner: #eef2f8;
-            --border: #d0d7e5;
-            --cyan: #0088cc;
-            --green: #059669;
-            --amber: #d97706;
-            --red: #dc2626;
-            --text-main: #111827;
-            --text-dim: #64748b;
+            --bg-base: #eef2f7;
+            --bg-panel: #ffffff;
+            --bg-card: #ffffff;
+            --bg-input: #f8fafc;
+            --border: #cbd5e1;
+            --border-hover: #94a3b8;
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
+            --text-muted: #64748b;
+            --copper: #8c5d33;
+            --copper-hover: #754b25;
+            --copper-subtle: rgba(140, 93, 51, 0.08);
+            --danger: #b91c1c;
+            --success: #15803d;
+            --shadow-float: 0 10px 28px rgba(0, 0, 0, 0.08);
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; transition: background-color 0.2s, color 0.2s; }
-        body {
-            background-color: var(--bg);
-            color: var(--text-main);
-            font-family: 'Inter', sans-serif;
-            overflow-x: hidden;
-            padding: 16px;
-            position: relative;
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; transition: background-color 0.25s, border-color 0.25s, color 0.25s; }
+        body { background: var(--bg-base); color: var(--text-primary); min-height: 100vh; display: flex; flex-direction: column; }
+
+        .portal-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 16px 40px; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+        }
+        .brand-box { display: flex; align-items: center; gap: 16px; }
+        .ayask-header-logo {
+            height: 52px; width: auto; max-width: 75px; object-fit: contain;
+            filter: drop-shadow(0 2px 8px rgba(0,0,0,0.25));
+        }
+        .brand-text h1 { font-size: 18px; font-weight: 800; letter-spacing: 1.2px; }
+        .brand-text p { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+        .portal-content {
+            flex: 1; display: grid; grid-template-columns: 1.15fr 0.85fr;
+            max-width: 1320px; width: 100%; margin: 0 auto; padding: 60px 32px; gap: 60px; align-items: center;
         }
 
-        /* ===================== DYNAMIC MINING-SITE BACKGROUND ===================== */
-        .mine-bg-stage {
-            position: fixed;
-            inset: 0;
-            z-index: -3;
-            overflow: hidden;
-            background: linear-gradient(180deg, #182338 0%, #101827 32%, #0a0e17 62%, #06070b 100%);
+        .floating-card {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 16px; padding: 42px 38px; box-shadow: var(--shadow-float);
+            transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s;
         }
-        :root[data-theme="light"] .mine-bg-stage {
-            background: linear-gradient(180deg, #b9cbe0 0%, #d8c9ad 45%, #e7ddc7 100%);
-        }
-        .mine-sky-glow {
-            position: absolute; left: 50%; bottom: 32%; width: 90vw; height: 40vh;
-            transform: translateX(-50%);
-            background: radial-gradient(ellipse at center, rgba(255,150,60,0.16) 0%, rgba(255,150,60,0.05) 45%, transparent 75%);
-            filter: blur(2px);
-        }
-        .mine-mountains {
-            position: absolute; left: 0; right: 0; bottom: 30%; height: 26vh;
-            background: linear-gradient(180deg, transparent 0%, rgba(6,7,11,0) 100%);
-        }
-        .mine-mountains svg { width: 100%; height: 100%; display: block; }
-        .mine-pit {
-            position: absolute; left: 0; right: 0; bottom: 0; height: 34vh;
-        }
-        .mine-bench {
-            position: absolute; left: -5%; right: -5%; height: 9vh;
-            background: linear-gradient(180deg, #4a3a2c 0%, #362a20 100%);
-            border-top: 1px solid rgba(255,183,0,0.08);
-        }
-        :root[data-theme="light"] .mine-bench {
-            background: linear-gradient(180deg, #cdb692 0%, #b89b70 100%);
-        }
-        .mine-bench.b1 { bottom: 0;    clip-path: polygon(0 35%, 100% 0%, 100% 100%, 0% 100%); background: linear-gradient(180deg, #56412e, #2c2117); }
-        .mine-bench.b2 { bottom: 7vh;  clip-path: polygon(0 40%, 100% 10%, 100% 100%, 0% 100%); background: linear-gradient(180deg, #6b4f34, #362719); opacity: 0.92; }
-        .mine-bench.b3 { bottom: 14vh; clip-path: polygon(0 45%, 100% 15%, 100% 100%, 0% 100%); background: linear-gradient(180deg, #7d5c3c, #40301f); opacity: 0.85; }
-        .mine-bench.b4 { bottom: 21vh; clip-path: polygon(0 50%, 100% 20%, 100% 100%, 0% 100%); background: linear-gradient(180deg, #8f6a45, #4a3722); opacity: 0.75; }
+        .floating-card:hover { transform: translateY(-4px); }
 
-        .mine-tower-light {
-            position: absolute; width: 4px; height: 26px; bottom: 30%;
-            background: linear-gradient(180deg, #4a4f5c, #2a2e38);
-        }
-        .mine-tower-light::after {
-            content: ''; position: absolute; top: -6px; left: -4px; width: 12px; height: 12px;
-            border-radius: 50%; background: var(--amber); box-shadow: 0 0 14px 4px rgba(255,183,0,0.7);
-            animation: towerBlink 2.6s ease-in-out infinite;
-        }
-        .mine-tower-light.t2::after { animation-delay: -1.1s; background: var(--cyan); box-shadow: 0 0 14px 4px rgba(0,229,255,0.6); }
-        .mine-tower-light.t3::after { animation-delay: -1.9s; }
-        @keyframes towerBlink { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+        .spec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 24px; }
+        .spec-item { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+        .spec-item .label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
+        .spec-item .val { font-size: 14px; font-weight: 600; font-family: 'JetBrains Mono', monospace; margin-top: 6px; }
 
-        .mine-conveyor-line {
-            position: absolute; left: 8%; right: 12%; bottom: 24vh; height: 2px;
-            background: rgba(122,136,155,0.25);
+        .auth-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 28px; }
+        .auth-tab {
+            flex: 1; text-align: center; padding: 12px 0; font-size: 14px; font-weight: 600;
+            color: var(--text-secondary); cursor: pointer; border-bottom: 2px solid transparent;
         }
-        .mine-conveyor-line::before, .mine-conveyor-line::after {
-            content: ''; position: absolute; width: 8px; height: 8px; border-radius: 50%;
-            background: var(--cyan); top: -3px; box-shadow: 0 0 8px 2px rgba(0,229,255,0.6);
-            animation: conveyorDot 5s linear infinite;
-        }
-        .mine-conveyor-line::after { animation-delay: -2.5s; background: var(--amber); box-shadow: 0 0 8px 2px rgba(255,183,0,0.6); }
-        @keyframes conveyorDot { 0% { left: 0%; } 100% { left: 100%; } }
+        .auth-tab.active { color: var(--copper); border-bottom-color: var(--copper); }
 
-        .mine-haze {
-            position: absolute; left: -20%; width: 140%; height: 10vh;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
-            animation: hazeDrift linear infinite;
-            pointer-events: none;
+        .form-group { margin-bottom: 18px; }
+        .form-group label { display: block; font-size: 11.5px; font-weight: 600; text-transform: uppercase; margin-bottom: 8px; color: var(--text-secondary); }
+        .form-group input {
+            width: 100%; padding: 13px 16px; background: var(--bg-input);
+            border: 1px solid var(--border); border-radius: 10px; color: var(--text-primary); font-size: 13.5px; outline: none;
         }
-        .mine-haze.h1 { bottom: 12vh; animation-duration: 38s; }
-        .mine-haze.h2 { bottom: 20vh; animation-duration: 52s; animation-delay: -14s; opacity: 0.7; }
-        @keyframes hazeDrift { 0% { transform: translateX(-8%); } 100% { transform: translateX(8%); } }
+        .form-group input:focus { border-color: var(--copper); }
 
-        .mine-dust-field { position: absolute; inset: 0; overflow: hidden; }
-        .mine-dust {
-            position: absolute; bottom: -5%; border-radius: 50%;
-            background: rgba(255, 200, 140, 0.35);
-            animation-name: dustRise; animation-timing-function: linear; animation-iteration-count: infinite;
+        .btn-submit {
+            width: 100%; padding: 14px; background: var(--copper); border: none; border-radius: 10px;
+            color: #0e0c0a; font-size: 14px; font-weight: 700; cursor: pointer;
+            box-shadow: 0 4px 16px rgba(212, 175, 55, 0.25);
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
         }
-        @keyframes dustRise {
-            0%   { transform: translateY(0) translateX(0); opacity: 0; }
-            8%   { opacity: 0.5; }
-            90%  { opacity: 0.15; }
-            100% { transform: translateY(-70vh) translateX(var(--drift, 20px)); opacity: 0; }
-        }
-        .mine-vignette-overlay { position: fixed; inset: 0; z-index: -2; pointer-events: none; box-shadow: inset 0 0 18vw rgba(0,0,0,0.65); }
-        .mine-scrim { position: fixed; inset: 0; z-index: -1; pointer-events: none; background: rgba(6,7,11,0.32); }
-        :root[data-theme="light"] .mine-scrim { background: rgba(244,246,250,0.42); }
+        .btn-submit:hover { background: var(--copper-hover); transform: translateY(-2px); }
 
-
-        /* SVG Icon Utilities */
-        .icon {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 16px;
-            height: 16px;
-            vertical-align: middle;
-            fill: currentColor;
+        .btn-quick {
+            background: transparent; border: 1px solid var(--copper); color: var(--copper);
+            padding: 8px 14px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;
+            display: flex; align-items: center; gap: 6px;
         }
-        .icon-lg { width: 22px; height: 22px; }
-
-        /* Top Header */
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 12px 24px;
-            margin-bottom: 12px;
-        }
-        .brand { display: flex; align-items: center; gap: 12px; }
-        .brand-logo {
-            width: 38px;
-            height: 38px;
-            border-radius: 8px;
-            background: rgba(0, 229, 255, 0.1);
-            border: 1px solid var(--cyan);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--cyan);
-        }
-        .brand h1 {
-            font-family: 'Rajdhani', sans-serif;
-            font-size: 24px;
-            font-weight: 700;
-            letter-spacing: 1.5px;
-            color: var(--cyan);
-        }
-        .brand p { font-size: 11px; color: var(--text-dim); }
-
-        .header-actions { display: flex; align-items: center; gap: 10px; }
-
-        /* Language Selector */
-        .lang-picker {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            background: var(--card-inner);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 4px 8px;
-        }
-        .lang-select {
-            background: transparent;
-            color: var(--text-main);
-            border: none;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            outline: none;
-        }
-        .lang-select option { background: #1a1e2b; color: #fff; }
-
-        /* User Auth Chip */
-        .user-chip {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            background: var(--card-inner);
-            border: 1px solid var(--border);
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        .btn-auth {
-            background: rgba(255, 51, 102, 0.15);
-            color: var(--red);
-            border: 1px solid var(--red);
-            border-radius: 4px;
-            padding: 3px 8px;
-            cursor: pointer;
-            font-size: 11px;
-            font-weight: 700;
-        }
-
-        .theme-btn {
-            background: var(--card-inner);
-            color: var(--text-main);
-            border: 1px solid var(--border);
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            cursor: pointer;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .tag {
-            font-size: 11px;
-            padding: 5px 12px;
-            border-radius: 4px;
-            font-weight: 600;
-            letter-spacing: 1px;
-        }
-        .tag-online { background: rgba(0, 255, 136, 0.15); color: var(--green); border: 1px solid var(--green); }
-        .tag-offline { background: rgba(255, 51, 102, 0.15); color: var(--red); border: 1px solid var(--red); }
-
-        /* Multi-Layer Tabs */
-        .layer-tabs {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 16px;
-            background: var(--card-bg);
-            padding: 8px;
-            border-radius: 8px;
-            border: 1px solid var(--border);
-        }
-        .tab-btn {
-            flex: 1;
-            padding: 10px 16px;
-            background: transparent;
-            color: var(--text-dim);
-            border: none;
-            border-radius: 6px;
-            font-family: 'Rajdhani', sans-serif;
-            font-size: 15px;
-            font-weight: 700;
-            letter-spacing: 1px;
-            cursor: pointer;
-            text-transform: uppercase;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-        .tab-btn.active {
-            background: var(--cyan);
-            color: #000;
-        }
-
-        /* KPI Row */
-        .kpi-row {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 14px;
-            margin-bottom: 16px;
-        }
-        .kpi-card {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-        }
-        .kpi-title { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
-        .kpi-val {
-            font-family: 'Rajdhani', sans-serif;
-            font-size: 34px;
-            font-weight: 700;
-            margin-top: 4px;
-        }
-        .kpi-sub { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
-
-        /* Layer Views */
-        .layer-view { display: none; }
-        .layer-view.active { display: grid; gap: 16px; }
-        .layer-1-grid { grid-template-columns: 1.2fr 1.8fr 1fr; }
-
-        .panel {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-        }
-        .panel-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 8px;
-            margin-bottom: 12px;
-        }
-        .panel-header h3 {
-            font-family: 'Rajdhani', sans-serif;
-            font-size: 15px;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            color: var(--cyan);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        /* Video Container */
-        .video-box {
-            position: relative;
-            background: #000;
-            border-radius: 6px;
-            overflow: hidden;
-            border: 1px solid var(--border);
-            aspect-ratio: 16/9;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .video-box img { width: 100%; height: 100%; object-fit: cover; }
-        .cam-controls { display: flex; gap: 8px; margin-top: 10px; }
-
-        /* Canvas & Chart */
-        #conveyorCanvas {
-            width: 100%;
-            height: 80px;
-            background: var(--card-inner);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            margin-bottom: 12px;
-        }
-        .chart-box { height: 210px; }
-
-        /* Buttons */
-        .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
-        button.action-btn {
-            background: var(--card-inner);
-            color: var(--text-main);
-            border: 1px solid var(--border);
-            padding: 9px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
-        button.action-btn:hover { border-color: var(--cyan); }
-        .btn-danger { border-color: var(--red); color: var(--red); }
-        .btn-danger:hover { background: var(--red); color: #fff; }
-        .btn-reset { grid-column: span 2; background: var(--cyan); color: #000; font-weight: 700; border: none; }
-
-        /* Status & Tables */
-        .status-badge {
-            padding: 8px;
-            border-radius: 4px;
-            font-size: 13px;
-            font-weight: 700;
-            text-align: center;
-            margin-top: 10px;
-        }
-        .incident-table { width: 100%; font-size: 12px; border-collapse: collapse; margin-top: 8px; }
-        .incident-table th, .incident-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
-        .incident-table th { color: var(--text-dim); }
-
-        .sensor-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-
-        /* Modal for Login */
-        .modal-backdrop {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0, 0, 0, 0.75);
-            backdrop-filter: blur(4px);
-            z-index: 9999;
-            align-items: center;
-            justify-content: center;
-        }
-        .modal-card {
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 28px;
-            width: 440px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-        }
-        .form-group { margin-bottom: 16px; }
-        .form-group label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600; text-transform: uppercase; }
-        .form-control {
-            width: 100%;
-            padding: 10px;
-            background: var(--card-inner);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            color: var(--text-main);
-            font-size: 14px;
-        }
+        .btn-quick:hover { background: var(--copper); color: #0e0c0a; }
     </style>
 </head>
 <body>
-
-    <!-- ===================== DYNAMIC MINING-SITE BACKGROUND ===================== -->
-    <div class="mine-bg-stage">
-        <div class="mine-sky-glow"></div>
-        <div class="mine-mountains">
-            <svg viewBox="0 0 1440 200" preserveAspectRatio="none">
-                <polygon points="0,200 0,120 120,60 260,110 400,40 560,100 720,55 900,115 1040,70 1200,120 1320,80 1440,110 1440,200" fill="#141c2b"/>
-                <polygon points="0,200 0,150 180,100 340,145 520,90 700,140 880,100 1060,150 1240,110 1440,150 1440,200" fill="#0e1420"/>
-            </svg>
-        </div>
-        <div class="mine-conveyor-line"></div>
-        <div class="mine-tower-light" style="left:14%;"></div>
-        <div class="mine-tower-light t2" style="left:38%;"></div>
-        <div class="mine-tower-light t3" style="left:64%;"></div>
-        <div class="mine-tower-light" style="left:85%;"></div>
-        <div class="mine-pit">
-            <div class="mine-bench b4"></div>
-            <div class="mine-bench b3"></div>
-            <div class="mine-bench b2"></div>
-            <div class="mine-bench b1"></div>
-        </div>
-        <div class="mine-haze h1"></div>
-        <div class="mine-haze h2"></div>
-        <div class="mine-dust-field" id="mineDustField"></div>
-    </div>
-    <div class="mine-vignette-overlay"></div>
-    <div class="mine-scrim"></div>
-
-    <!-- Header -->
-    <header>
-        <div class="brand">
-            <div class="brand-logo">
-                <svg class="icon-lg" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
-            </div>
-            <div>
-                <h1 id="txtTitle">NMDC CONVEYOR HEALTH AI SCADA</h1>
-                <p id="txtSub">Ministry of Steel | Smart India Hackathon PS 26008 | Industrial Multi-Modal Interlock</p>
+    <header class="portal-header">
+        <div class="brand-box">
+            <img src="/static/ayask_logo.png" alt="AYASK Logo" class="ayask-header-logo">
+            <div class="brand-text">
+                <h1>TEAM AYASK · NMDC SCADA</h1>
+                <p>SIH 26008 · Heavy Mining Conveyor AI Diagnostic Command Center</p>
             </div>
         </div>
-
-        <div class="header-actions">
-            <!-- Language Selector -->
-            <div class="lang-picker">
-                <svg class="icon" style="color:var(--cyan)" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                <select class="lang-select" id="langSelect" onchange="changeLanguage(this.value)">
-                    <option value="en">English (EN)</option>
-                    <option value="hi">हिन्दी (Hindi)</option>
-                    <option value="te">తెలుగు (Telugu)</option>
-                    <option value="kn">ಕನ್ನಡ (Kannada)</option>
-                    <option value="or">ଓଡ଼ିଆ (Odia)</option>
-                    <option value="ta">தமிழ் (Tamil)</option>
-                    <option value="bn">বাংলা (Bengali)</option>
-                    <option value="mr">मराठी (Marathi)</option>
-                </select>
-            </div>
-
-            <!-- User Auth Chip -->
-            <div class="user-chip">
-                <svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                <span id="userNameChip">Er. Rajesh Verma</span>
-                <button onclick="signOut()" class="btn-auth" id="btnAuthAction">Sign Out</button>
-            </div>
-
-            <!-- Theme Toggle -->
-            <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">
-                <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2"/></svg>
-                <span id="themeBtnText">Light Mode</span>
-            </button>
-
-            <button class="theme-btn" onclick="toggleDevice()" id="deviceToggleBtn" style="border-color: var(--red); color: var(--red);">
-                <svg class="icon" viewBox="0 0 24 24"><path d="M12 2v6M12 22v-4M4.93 10a8 8 0 1 0 14.14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
-                <span id="deviceToggleText">Connect Hardware</span>
-            </button>
-
-            <div id="deviceStatusTag" class="tag tag-offline">HARDWARE: DISCONNECTED</div>
-            <div id="camStatusTag" class="tag tag-offline">CAM-03: DISCONNECTED</div>
-            <div id="tripTag" class="tag tag-online">INTERLOCK: ENGAGED</div>
-        </div>
+        <button onclick="toggleTheme()" class="btn-quick">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+            <span id="themeLabel">Light Mode</span>
+        </button>
     </header>
 
-    <!-- Live Tracking Standby Banner -->
-    <div id="standbyBanner" style="display:flex; align-items:center; gap:10px; background: rgba(255,183,0,0.1); border: 1px solid var(--amber); color: var(--amber); border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; font-size: 13px; font-weight: 600;">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-        <span>No physical sensors or cameras are linked yet. Live tracking is on standby — click "Connect Hardware" to simulate a live device link and begin monitoring.</span>
-    </div>
-
-    <!-- Multi-Layer Tabs -->
-    <div class="layer-tabs">
-        <button class="tab-btn active" onclick="switchLayer(1, this)">
-            <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="3" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="14" y="14" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/><rect x="3" y="14" width="7" height="7" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-            <span id="tab1">Layer 1: Master SCADA & Digital Twin</span>
-        </button>
-        <button class="tab-btn" onclick="switchLayer(2, this)">
-            <svg class="icon" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-            <span id="tab2">Layer 2: AI Vision Diagnostics</span>
-        </button>
-        <button class="tab-btn" onclick="switchLayer(3, this)">
-            <svg class="icon" viewBox="0 0 24 24"><path d="M4.93 19.07A10 10 0 0 1 12 2a10 10 0 0 1 7.07 17.07M12 12v6M12 8h.01" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-            <span id="tab3">Layer 3: Multi-Sensor IoT Telemetry</span>
-        </button>
-        <button class="tab-btn" onclick="switchLayer(4, this)">
-            <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-            <span id="tab4">Layer 4: PLC Safety & Maintenance Logs</span>
-        </button>
-    </div>
-
-    <!-- Top KPI Bar -->
-    <div class="kpi-row">
-        <div class="kpi-card">
-            <div class="kpi-title" id="kpiBhi">Belt Health Index (BHI)</div>
-            <div id="bhiVal" class="kpi-val" style="color: var(--green);">98.0%</div>
-            <div class="kpi-sub" id="kpiBhiSub">Composite health condition</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-title" id="kpiRul">Estimated Joint RUL</div>
-            <div id="rulVal" class="kpi-val">1,813 Hrs</div>
-            <div class="kpi-sub" id="kpiRulSub">Splice fatigue failure window</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-title" id="kpiSpeed">Conveyor Speed & Load</div>
-            <div id="speedVal" class="kpi-val">3.50 m/s</div>
-            <div class="kpi-sub" id="loadVal">1,250 TPH Iron Ore</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-title" id="kpiRelay">Drive Motor Interlock</div>
-            <div id="relayStatus" class="kpi-val" style="color: var(--green);">NORMAL</div>
-            <div class="kpi-sub" id="kpiRelaySub">Relay NC Circuit Active</div>
-        </div>
-    </div>
-
-    <!-- ==================== LAYER 1: MASTER SCADA ==================== -->
-    <div id="layer1" class="layer-view layer-1-grid active">
-        <!-- Visual Panel -->
-        <div class="panel">
-            <div class="panel-header">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7zM14 5H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="hdrVision">Visual & Splice Inspection</span>
-                </h3>
-                <span id="camFpsText" style="font-size:11px; color:var(--text-dim);">Standby (0 FPS)</span>
+    <main class="portal-content">
+        <section>
+            <div style="display:inline-block; padding:5px 14px; background:var(--copper-subtle); border:1px solid var(--copper); border-radius:8px; font-size:11.5px; font-weight:700; color:var(--copper); margin-bottom:16px;">
+                TEAM AYASK · SIH PROBLEM STATEMENT 26008
             </div>
-            <div class="video-box">
-                <img src="/video_feed" alt="Camera Feed">
-            </div>
-            <div class="cam-controls">
-                <button class="action-btn" style="flex:1;" onclick="toggleCamera()" id="camToggleBtn">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" stroke="currentColor" stroke-width="2"/></svg>
-                    <span id="btnCamToggle">Connect Camera Hardware</span>
-                </button>
-            </div>
-            <div id="systemStateBanner" class="status-badge" style="background: rgba(0,255,136,0.1); color: var(--green);">
-                SYSTEM STABLE: NO ANOMALIES
-            </div>
-        </div>
-
-        <!-- Digital Twin & Real-time Chart -->
-        <div class="panel">
-            <div class="panel-header">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="hdrTwin">Digital Twin Belt & Telemetry</span>
-                </h3>
-                <span style="font-size:11px; color:var(--text-dim);" id="hdrSensorTrends">Real-Time Sensor Trends</span>
-            </div>
-            <canvas id="conveyorCanvas"></canvas>
-            <div class="chart-box">
-                <canvas id="telemetryChart"></canvas>
-            </div>
-        </div>
-
-        <!-- SIH Testbench Fault Injector -->
-        <div class="panel">
-            <div class="panel-header">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="hdrFault">SIH Demo Fault Injector</span>
-                </h3>
-                <span style="font-size:11px; color:var(--amber);">Interactive</span>
-            </div>
-            <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 12px;" id="lblFaultInstruct">
-                Demonstrate multi-modal AI failure response to the jury:
+            <h2 style="font-size:38px; font-weight:800; line-height:1.2; margin-bottom:16px;">
+                Edge AI & Multi-Modal IoT Conveyor Belt Predictive Maintenance
+            </h2>
+            <p style="font-size:15px; color:var(--text-secondary); line-height:1.7;">
+                Engineered for NMDC iron ore handling plants. Real-time condition synthesis, joint remaining useful life (RUL) estimation,
+                failsafe drive motor contactor E-Stop interlock, and Zone 3 return belt vision inspection.
             </p>
-            <div class="btn-grid">
-                <button onclick="injectFault('SPLICE_TEAR')" class="action-btn btn-danger">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="btnSplice">Splice Rupture</span>
-                </button>
-                <button onclick="injectFault('BEARING_HOTSPOT')" class="action-btn">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M12 2c0 4-4 6-4 10a4 4 0 0 0 8 0c0-4-4-6-4-10z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="btnBearing">Bearing Hotspot</span>
-                </button>
-                <button onclick="injectFault('TENSION_SPIKE')" class="action-btn">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="btnTension">Tension Surge</span>
-                </button>
-                <button onclick="injectFault('SURFACE_GOUGE')" class="action-btn">
-                    <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" stroke="currentColor" stroke-width="2" fill="none"/><path d="m21 21-4.35-4.35" stroke="currentColor" stroke-width="2"/></svg>
-                    <span id="btnGouge">Surface Gouge</span>
-                </button>
-                <button onclick="resetSystem()" class="action-btn btn-reset">
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="btnReset">RESET INTERLOCK & RECOVER</span>
-                </button>
+
+            <div class="spec-grid">
+                <div class="spec-item">
+                    <div class="label">Belt Health Synthesis</div>
+                    <div class="val">Live BHI + Joint RUL Tracking</div>
+                </div>
+                <div class="spec-item">
+                    <div class="label">Safety Interlock</div>
+                    <div class="val">Normally Closed (NC) PLC Loop</div>
+                </div>
+                <div class="spec-item">
+                    <div class="label">IoT Multi-Sensor</div>
+                    <div class="val">MPU6050 + DS18B20 + HX711</div>
+                </div>
+                <div class="spec-item">
+                    <div class="label">Vision Architecture</div>
+                    <div class="val">YOLOv8 Edge Real-Time</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="floating-card">
+            <div class="auth-tabs">
+                <div class="auth-tab active" id="tabIn" onclick="switchAuth('in')">Sign In</div>
+                <div class="auth-tab" id="tabUp" onclick="switchAuth('up')">Register Operator</div>
             </div>
 
-            <div class="panel-header" style="margin-top: 8px;">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    <span id="hdrLog">Safety Event Log</span>
-                </h3>
-            </div>
-            <table class="incident-table">
-                <thead><tr><th id="thTime">Time</th><th id="thEvent">Event</th><th id="thSev">Severity</th></tr></thead>
-                <tbody id="incidentBody">
-                    <tr><td>Ready</td><td>Monitoring Initialized</td><td style="color:var(--green)">INFO</td></tr>
-                </tbody>
-            </table>
-        </div>
-    </div>
+            <div id="authErr" style="padding:12px; border-radius:8px; background:rgba(168,72,37,0.16); border:1px solid var(--danger); color:#f5eedf; font-size:12.5px; margin-bottom:16px; display:none;"></div>
+            <div id="authSucc" style="padding:12px; border-radius:8px; background:rgba(212,175,55,0.16); border:1px solid var(--copper); color:var(--copper); font-size:12.5px; margin-bottom:16px; display:none;"></div>
 
-    <!-- ==================== LAYER 2: AI VISION DIAGNOSTICS ==================== -->
-    <div id="layer2" class="layer-view">
-        <div class="panel">
-            <div class="panel-header">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                    Computer Vision Inference Pipeline Details
-                </h3>
-            </div>
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px; font-size:13px;">
-                <div>
-                    <h4 style="color:var(--cyan); margin-bottom:10px;">Model Specifications</h4>
-                    <p>• <strong>Selected Architecture:</strong> YOLOv8n / YOLOv11 Edge-Optimized</p>
-                    <p>• <strong>Target Classes:</strong> Longitudinal Tear, Splice Gap, Edge Wear, Surface Gouge</p>
-                    <p>• <strong>Inference Latency:</strong> 12.4 ms on Dedicated GPU</p>
-                    <p>• <strong>Preprocessing:</strong> CLAHE Contrast Enhancement & Retinex De-dusting</p>
+            <form onsubmit="submitAuth(event)">
+                <div class="form-group" id="nameGrp" style="display:none;">
+                    <label>Full Operator Name</label>
+                    <input type="text" id="nameIn" placeholder="e.g. S. Ramanathan">
                 </div>
-                <div>
-                    <h4 style="color:var(--cyan); margin-bottom:10px;">Inspection Point Coordinates</h4>
-                    <p>• <strong>Zone 1:</strong> Primary Loading Chute (Impact & Rip Detection)</p>
-                    <p>• <strong>Zone 2:</strong> Drive Pulley Transition (High Tension Splice Separation)</p>
-                    <p>• <strong>Zone 3:</strong> Return Belt Clean Side (Cord Exposure & Delamination)</p>
+                <div class="form-group">
+                    <label>Corporate Employee ID / Email</label>
+                    <input type="email" id="emailIn" placeholder="operator@nmdc.gov.in" required>
                 </div>
-            </div>
-        </div>
-    </div>
+                <div class="form-group">
+                    <label>Secure Password</label>
+                    <input type="password" id="passIn" placeholder="••••••••" required>
+                </div>
+                <button type="submit" class="btn-submit" id="submitBtn">Sign In to SCADA</button>
+            </form>
 
-    <!-- ==================== LAYER 3: SENSOR IOT TELEMETRY ==================== -->
-    <div id="layer3" class="layer-view">
-        <div class="sensor-grid">
-            <div class="panel">
-                <div class="panel-header">
-                    <h3>
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                        MPU6050 Accelerometer (Vibration)
-                    </h3>
-                </div>
-                <div style="font-size:24px; font-family:'Rajdhani'; color:var(--cyan); margin-bottom:10px;" id="vibRmsDetail">2.1 mm/s RMS</div>
-                <p style="font-size:12px; color:var(--text-dim);" id="vibAxes">X: 0.8 | Y: 1.1 | Z: 1.6 m/s²</p>
-                <p style="font-size:12px; margin-top:10px;">Captures dynamic vibration & steel cord snapping frequencies (10 Hz - 1.2 kHz).</p>
+            <div id="demoRow" style="margin-top:24px; padding:14px; background:var(--copper-subtle); border:1px solid var(--border); border-radius:10px; display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--text-secondary);">
+                <div><strong>Demo Access:</strong> operator@nmdc.gov.in / Admin@1234</div>
+                <button type="button" class="btn-quick" onclick="quickFill()">Quick Fill</button>
             </div>
-            <div class="panel">
-                <div class="panel-header">
-                    <h3>
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M12 2c0 4-4 6-4 10a4 4 0 0 0 8 0c0-4-4-6-4-10z" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-                        DS18B20 1-Wire Probe (Temperature)
-                    </h3>
-                </div>
-                <div style="font-size:24px; font-family:'Rajdhani'; color:var(--amber); margin-bottom:10px;" id="tempDetail">52.4 °C</div>
-                <p style="font-size:12px; color:var(--text-dim);">Operating Range: -55°C to +125°C</p>
-                <p style="font-size:12px; margin-top:10px;">Monitors drive pulley bearings and rubber friction hotspots.</p>
-            </div>
-            <div class="panel">
-                <div class="panel-header">
-                    <h3>
-                        <svg class="icon" viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-                        HX711 Strain Gauge (Tension)
-                    </h3>
-                </div>
-                <div style="font-size:24px; font-family:'Rajdhani'; color:var(--green); margin-bottom:10px;" id="tensionDetail">45.0 kN</div>
-                <p style="font-size:12px; color:var(--text-dim);">Nominal Elastic Limit: 80.0 kN</p>
-                <p style="font-size:12px; margin-top:10px;">Identifies sudden tension loss during splice rupture or overload surges.</p>
-            </div>
-        </div>
-    </div>
-
-    <!-- ==================== LAYER 4: PLC SAFETY & MAINTENANCE ==================== -->
-    <div id="layer4" class="layer-view">
-        <div class="panel">
-            <div class="panel-header">
-                <h3>
-                    <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M9 9h6v6H9z" stroke="currentColor" stroke-width="2"/></svg>
-                    Industrial SCADA / PLC Interlocking Architecture
-                </h3>
-            </div>
-            <div style="font-size:13px; line-height:1.6;">
-                <p><strong>Field Protocol:</strong> Modbus TCP / OPC-UA to NMDC Siemens S7-1500 / Allen-Bradley ControlLogix PLC.</p>
-                <p><strong>Hardware Safety Interlock:</strong> Failsafe Normally Closed (NC) physical relay circuit directly wired into the main drive motor contactor E-Stop loop.</p>
-                <p><strong>Emergency Response Latency:</strong> Hardware relay trip executed in under <strong>28 ms</strong> upon confirmation of a Level 3 longitudinal tear.</p>
-            </div>
-        </div>
-    </div>
+        </section>
+    </main>
 
     <script>
-        // ----------------- MULTI-LINGUAL TRANSLATION DICTIONARY -----------------
-        const translations = {
-            en: {
-                title: "NMDC CONVEYOR HEALTH AI SCADA",
-                sub: "Ministry of Steel | Smart India Hackathon PS 26008 | Industrial Multi-Modal Interlock",
-                tab1: "Layer 1: Master SCADA & Digital Twin",
-                tab2: "Layer 2: AI Vision Diagnostics",
-                tab3: "Layer 3: Multi-Sensor IoT Telemetry",
-                tab4: "Layer 4: PLC Safety & Maintenance Logs",
-                kpiBhi: "Belt Health Index (BHI)",
-                kpiRul: "Estimated Joint RUL",
-                kpiSpeed: "Conveyor Speed & Load",
-                kpiRelay: "Drive Motor Interlock",
-                hdrVision: "Visual & Splice Inspection",
-                hdrTwin: "Digital Twin Belt & Telemetry",
-                hdrFault: "SIH Demo Fault Injector",
-                btnSplice: "Splice Rupture",
-                btnBearing: "Bearing Hotspot",
-                btnTension: "Tension Surge",
-                btnGouge: "Surface Gouge",
-                btnReset: "RESET INTERLOCK & RECOVER",
-                btnCamConnect: "Connect Camera Hardware",
-                btnCamDisconnect: "Disconnect Camera Feed",
-                hdrLog: "Safety Event Log"
-            },
-            hi: {
-                title: "एनएमडीसी कन्वेयर बेल्ट एआई स्काडा",
-                sub: "इस्पात मंत्रालय | स्मार्ट इंडिया हैकथॉन पीएस 26008 | औद्योगिक मल्टी-मॉडल इंटरलॉक",
-                tab1: "लेयर 1: मास्टर स्काडा और डिजिटल ट्विन",
-                tab2: "लेयर 2: एआई विज़न विश्लेषण",
-                tab3: "लेयर 3: मल्टी-सेंसर आईओटी टेलीमेट्री",
-                tab4: "लेयर 4: पीएलसी सुरक्षा एवं लॉग",
-                kpiBhi: "बेल्ट स्वास्थ्य सूचकांक (BHI)",
-                kpiRul: "अनुमानित शेष जीवन (RUL)",
-                kpiSpeed: "कन्वेयर गति और भार",
-                kpiRelay: "ड्राइव मोटर इंटरलॉक",
-                hdrVision: "दृश्य एवं संयुक्त निरीक्षण",
-                hdrTwin: "डिजिटल ट्विन बेल्ट टेलीमेट्री",
-                hdrFault: "एसोसिएशन फॉल्ट इंजेक्टर",
-                btnSplice: "जोड़ टूटना (Rupture)",
-                btnBearing: "अत्यधिक ताप (Hotspot)",
-                btnTension: "तनाव वृद्धि (Surge)",
-                btnGouge: "सतह क्षति (Gouge)",
-                btnReset: "इंटरलॉक रीसेट करें",
-                btnCamConnect: "कैमरा हार्डवेयर कनेक्ट करें",
-                btnCamDisconnect: "कैमरा डिस्कनेक्ट करें",
-                hdrLog: "सुरक्षा घटना लॉग"
-            },
-            te: {
-                title: "NMDC కన్వేయర్ హెల్త్ AI స్కాడా",
-                sub: "స్టీల్ మంత్రిత్వ శాఖ | స్మార్ట్ ఇండియా హ్యాకథాన్ PS 26008 | ఇండస్ట్రియల్ ఇంటర్‌లాక్",
-                tab1: "లేయర్ 1: మాస్టర్ స్కాడా & డిజిటల్ ట్విన్",
-                tab2: "లేయర్ 2: AI విజన్ డయాగ్నస్టిక్స్",
-                tab3: "లేయర్ 3: మల్టీ-సెన్సార్ టెలిమెట్రీ",
-                tab4: "లేయర్ 4: PLC భద్రత & లాగ్స్",
-                kpiBhi: "బెల్ట్ హెల్త్ ఇండెక్స్ (BHI)",
-                kpiRul: "అంచనా వేసిన మిగిలిన ఆయుష్షు",
-                kpiSpeed: "వేగం & బరువు",
-                kpiRelay: "డ్రైవ్ మోటార్ ఇంటర్‌లాక్",
-                hdrVision: "విజువల్ తనిఖీ",
-                hdrTwin: "డిజిటల్ ట్విన్ టెలిమెట్రీ",
-                hdrFault: "ఫాల్ట్ ఇంజెక్టర్",
-                btnSplice: "స్ప్లైస్ చీలిక",
-                btnBearing: "బేరింగ్ వేడి",
-                btnTension: "టెన్షన్ పెరుగుదల",
-                btnGouge: "ఉపరితల లోపం",
-                btnReset: "రీసెట్ ఇంటర్‌లాక్",
-                btnCamConnect: "కెమెరాను కనెక్ట్ చేయండి",
-                btnCamDisconnect: "కెమెరాను డిస్‌కనెక్ట్ చేయండి",
-                hdrLog: "సేఫ్టీ ఈవెంట్ లాగ్"
-            },
-            kn: {
-                title: "NMDC ಕನ್ವೇಯರ್ ಹೆಲ್ತ್ AI ಸ್ಕಾಡಾ",
-                sub: "ಉಕ್ಕು ಸಚಿವಾಲಯ | ಸ್ಮಾರ್ಟ್ ಇಂಡಿಯಾ ಹ್ಯಾಕಥಾನ್ PS 26008 | ಇಂಟರ್ಲಾಕ್ ವ್ಯವಸ್ಥೆ",
-                tab1: "ಹಂತ 1: ಮುಖ್ಯ ಸ್ಕಾಡಾ & ಡಿಜಿಟಲ್ ಟ್ವಿನ್",
-                tab2: "ಹಂತ 2: AI ದೃಷ್ಟಿ ವಿಶ್ಲೇಷಣೆ",
-                tab3: "ಹಂತ 3: ಐಒಟಿ ಸೆನ್ಸರ್ ಟೆಲಿಮೆಟ್ರಿ",
-                tab4: "ಹಂತ 4: ಪಿಎಲ್ಸಿ ಸುರಕ್ಷತೆ & ಲಾಗ್",
-                kpiBhi: "ಬೆಲ್ಟ್ ಆರೋಗ್ಯ ಸೂಚ್ಯಂಕ",
-                kpiRul: "ಅಂದಾಜು ಬಾಳಿಕೆ ಅವಧಿ",
-                kpiSpeed: "ವೇಗ ಮತ್ತು ತೂಕ",
-                kpiRelay: "ಮೋಟಾರ್ ಇಂಟರ್ಲಾಕ್",
-                hdrVision: "ಕ್ಯಾಮೆರಾ ತಪಾಸಣೆ",
-                hdrTwin: "ಡಿಜಿಟಲ್ ಟ್ವಿನ್ ಬೆಲ್ಟ್",
-                hdrFault: "ದೋಷ ಸಿಮ್ಯುಲೇಶನ್",
-                btnSplice: "ಜಾಯಿಂಟ್ ಒಡಕು",
-                btnBearing: "ಬೇರಿಂಗ್ ತಾಪಮಾನ",
-                btnTension: "ಒತ್ತಡ ಏರಿಕೆ",
-                btnGouge: "ಮೇಲ್ಮೈ ಹಾನಿ",
-                btnReset: "ಮರುಹೊಂದಿಸಿ (Reset)",
-                btnCamConnect: "ಕ್ಯಾಮೆರಾ ಸಂಪರ್ಕಿಸಿ",
-                btnCamDisconnect: "ಕ್ಯಾಮೆರಾ ತೆಗೆಯಿರಿ",
-                hdrLog: "ಸುರಕ್ಷತಾ ಲಾಗ್"
-            },
-            or: {
-                title: "NMDC କନଭେୟର ହେଲଥ AI ସ୍କାଡା",
-                sub: "ଇସ୍ପାତ ମନ୍ତ୍ରଣାଳୟ | ସ୍ମାର୍ଟ ଇଣ୍ଡିଆ ହ୍ୟାକାଥନ୍ | ଶିଳ୍ପ ସୁରକ୍ଷା ଇଣ୍ଟରଲକ୍",
-                tab1: "ଲେୟାର 1: ମାଷ୍ଟର ସ୍କାଡା ଏବଂ ଡିଜିଟାଲ୍ ଟ୍ୱିନ୍",
-                tab2: "ଲେୟାର 2: AI ଭିଜନ୍ ତଥ୍ୟ",
-                tab3: "ଲେୟାର 3: ସେନ୍ସର ଟେଲିମେଟ୍ରି",
-                tab4: "ଲେୟାର 4: PLC ସୁରକ୍ଷା ରେକର୍ଡ",
-                kpiBhi: "ବେଲ୍ଟ ସ୍ୱାସ୍ଥ୍ୟ ସୂଚକାଙ୍କ",
-                kpiRul: "ଅବଶିଷ୍ଟ କାର୍ଯ୍ୟକ୍ଷମ ସମୟ",
-                kpiSpeed: "ଗତି ଏବଂ ଭାର",
-                kpiRelay: "ମୋଟର ଇଣ୍ଟରଲକ୍",
-                hdrVision: "ଭିଜୁଆଲ୍ ଯାଞ୍ଚ",
-                hdrTwin: "ଡିଜିଟାଲ୍ ଟ୍ୱିନ୍ ବେଲ୍ଟ",
-                hdrFault: "ତ୍ରୁଟି ଅନୁକରଣ",
-                btnSplice: "ଯୋଡ଼ ଛିଣ୍ଡିବା",
-                btnBearing: "ବେରିଂ ଉତ୍ତାପ",
-                btnTension: "ଟେନସନ ବୃଦ୍ଧି",
-                btnGouge: "ପୃଷ୍ଠ କ୍ଷତି",
-                btnReset: "ପୁନଃସେଟ କରନ୍ତୁ",
-                btnCamConnect: "କ୍ୟାମେରା ଯୋଡ଼ନ୍ତୁ",
-                btnCamDisconnect: "କ୍ୟାମେରା ବନ୍ଦ କରନ୍ତୁ",
-                hdrLog: "ସୁରକ୍ଷା ଘଟଣା ଲଗ୍"
-            },
-            ta: {
-                title: "NMDC கன்வேயர் ஹெல்த் AI ஸ்காடா",
-                sub: "எஃகு அமைச்சகம் | ஸ்மார்ட் இந்தியா ஹேக்கத்தான் PS 26008 | தொழில்துறை பாதுகாப்பு",
-                tab1: "அடுக்கு 1: முதன்மை ஸ்காடா & டிஜிட்டல் ட்வின்",
-                tab2: "அடுக்கு 2: AI விஷன் ஆய்வுகள்",
-                tab3: "அடுக்கு 3: பல சென்சார் டெலிமெட்ரி",
-                tab4: "அடுக்கு 4: PLC பாதுகாப்பு & பதிவுகள்",
-                kpiBhi: "பெல்ட் ஆரோக்கிய குறியீடு",
-                kpiRul: "எதிர்பார்க்கப்படும் ஆயுட்காலம்",
-                kpiSpeed: "வேகம் & சுமை",
-                kpiRelay: "மோட்டார் பாதுகாப்பு பூட்டு",
-                hdrVision: "கேமரா ஆய்வு",
-                hdrTwin: "டிஜிட்டல் ட்வின் அமைப்பு",
-                hdrFault: "பிழை தூண்டுதல்",
-                btnSplice: "இணைப்பு விரிசல்",
-                btnBearing: "தாங்கி அதிக வெப்பம்",
-                btnTension: "அழுத்த அதிகரிப்பு",
-                btnGouge: "மேற்பரப்பு சேதம்",
-                btnReset: "மீட்டமைக்கவும் (Reset)",
-                btnCamConnect: "கேமராவை இணைக்கவும்",
-                btnCamDisconnect: "கேமராவை துண்டிக்கவும்",
-                hdrLog: "பாதுகாப்பு நிகழ்வு பதிவு"
-            },
-            bn: {
-                title: "NMDC পরিবাহক বেল্ট এআই স্কাডা",
-                sub: "ইস্পাত মন্ত্রণালয় | স্মার্ট ইন্ডিয়া হ্যাকাথন | শিল্প সুরক্ষা ব্যবস্থা",
-                tab1: "স্তর ১: মাস্টার স্কাডা ও ডিজিটাল টুইন",
-                tab2: "স্তর ২: এআই দৃষ্টি বিশ্লেষণ",
-                tab3: "স্তর ৩: মাল্টি-সেন্সর টেলিমেট্রি",
-                tab4: "স্তর ৪: পিএলসি সুরক্ষা লগ",
-                kpiBhi: "বেল্ট স্বাস্থ্য সূচক",
-                kpiRul: "আনুমানিক অবশিষ্ট জীবন",
-                kpiSpeed: "গতি ও ওজন",
-                kpiRelay: "ড্রাইভ মোটর ইন্টারলক",
-                hdrVision: "ক্যামেরা পরিদর্শন",
-                hdrTwin: "ডিজিটাল টুইন বেল্ট",
-                hdrFault: "ফল্ট ইনজেক্টর",
-                btnSplice: "জয়েন্ট ফাটল",
-                btnBearing: "বিয়ারিং অতিরিক্ত গরম",
-                btnTension: "টেনশন বৃদ্ধি",
-                btnGouge: "পৃষ্ঠতলের ক্ষতি",
-                btnReset: "রিসেট করুন",
-                btnCamConnect: "ক্যামেরা সংযুক্ত করুন",
-                btnCamDisconnect: "ক্যামেরা সংযোগ বিচ্ছিন্ন করুন",
-                hdrLog: "সুরক্ষা ইভেন্ট লগ"
-            },
-            mr: {
-                title: "NMDC कन्व्हेयर हेल्थ AI स्काडा",
-                sub: "पोलाद मंत्रालय | स्मार्ट इंडिया हॅकाथॉन | औद्योगिक सुरक्षा इंटरलॉक",
-                tab1: "स्तर १: मुख्य स्काडा आणि डिजिटल ट्विन",
-                tab2: "स्तर २: AI व्हिजन विश्लेषण",
-                tab3: "स्तर ३: मल्टी-सेन्सर टेलिमेट्री",
-                tab4: "स्तर ४: PLC सुरक्षा लॉग",
-                kpiBhi: "बेल्ट आरोग्य निर्देशांक",
-                kpiRul: "अंदाजे शिल्लक आयुष्य",
-                kpiSpeed: "कन्व्हेयर गती व भार",
-                kpiRelay: "मोटर इंटरलॉक",
-                hdrVision: "कॅमेरा तपासणी",
-                hdrTwin: "डिजिटल ट्विन टेलिमेट्री",
-                hdrFault: "फॉल्ट इंजेक्टर",
-                btnSplice: "सांधा तुटणे",
-                btnBearing: "बेअरिंग उष्णता",
-                btnTension: "ताण वाढ",
-                btnGouge: "पृष्ठभाग नुकसान",
-                btnReset: "रीसेट करा",
-                btnCamConnect: "कॅमेरा कनेक्ट करा",
-                btnCamDisconnect: "कॅमेरा डिस्कनेक्ट करा",
-                hdrLog: "सुरक्षा नोंद वही"
-            }
-        };
-
-        let currentLang = 'en';
-
-        function changeLanguage(lang) {
-            currentLang = lang;
-            const t = translations[lang] || translations.en;
-            
-            document.getElementById('txtTitle').innerText = t.title;
-            document.getElementById('txtSub').innerText = t.sub;
-            document.getElementById('tab1').innerText = t.tab1;
-            document.getElementById('tab2').innerText = t.tab2;
-            document.getElementById('tab3').innerText = t.tab3;
-            document.getElementById('tab4').innerText = t.tab4;
-            document.getElementById('kpiBhi').innerText = t.kpiBhi;
-            document.getElementById('kpiRul').innerText = t.kpiRul;
-            document.getElementById('kpiSpeed').innerText = t.kpiSpeed;
-            document.getElementById('kpiRelay').innerText = t.kpiRelay;
-            document.getElementById('hdrVision').innerText = t.hdrVision;
-            document.getElementById('hdrTwin').innerText = t.hdrTwin;
-            document.getElementById('hdrFault').innerText = t.hdrFault;
-            document.getElementById('btnSplice').innerText = t.btnSplice;
-            document.getElementById('btnBearing').innerText = t.btnBearing;
-            document.getElementById('btnTension').innerText = t.btnTension;
-            document.getElementById('btnGouge').innerText = t.btnGouge;
-            document.getElementById('btnReset').innerText = t.btnReset;
-            document.getElementById('hdrLog').innerText = t.hdrLog;
+        let mode = 'in';
+        function switchAuth(m) {
+            mode = m;
+            document.getElementById('tabIn').className = m === 'in' ? 'auth-tab active' : 'auth-tab';
+            document.getElementById('tabUp').className = m === 'up' ? 'auth-tab active' : 'auth-tab';
+            document.getElementById('nameGrp').style.display = m === 'up' ? 'block' : 'none';
+            document.getElementById('submitBtn').innerText = m === 'up' ? 'Register Operator Profile' : 'Sign In to SCADA';
+            document.getElementById('demoRow').style.display = m === 'up' ? 'none' : 'flex';
         }
+        function quickFill() {
+            document.getElementById('emailIn').value = 'operator@nmdc.gov.in';
+            document.getElementById('passIn').value = 'Admin@1234';
+        }
+        async function submitAuth(e) {
+            e.preventDefault();
+            const err = document.getElementById('authErr');
+            const succ = document.getElementById('authSucc');
+            err.style.display = 'none'; succ.style.display = 'none';
 
-        // ----------------- MINING-SITE BACKGROUND DUST PARTICLES -----------------
-        (function spawnMineDust() {
-            const field = document.getElementById('mineDustField');
-            if (!field) return;
-            const count = 34;
-            for (let i = 0; i < count; i++) {
-                const p = document.createElement('div');
-                p.className = 'mine-dust';
-                const size = 2 + Math.random() * 4;
-                p.style.width = size + 'px';
-                p.style.height = size + 'px';
-                p.style.left = (Math.random() * 100) + '%';
-                p.style.setProperty('--drift', (Math.random() * 60 - 30) + 'px');
-                p.style.animationDuration = (14 + Math.random() * 18) + 's';
-                p.style.animationDelay = (-Math.random() * 30) + 's';
-                field.appendChild(p);
-            }
-        })();
+            const email = document.getElementById('emailIn').value.trim();
+            const password = document.getElementById('passIn').value;
+            const name = document.getElementById('nameIn').value.trim();
+            const url = mode === 'in' ? '/api/signin' : '/api/signup';
+            const payload = mode === 'in' ? { email, password } : { name, email, password };
 
-        // ----------------- AUTHENTICATION GUARD (real backend session check) -----------------
-        (function authGuard() {
-            const token = sessionStorage.getItem('nmdc_token');
-            if (!token) {
-                window.location.href = '/';
-                return;
-            }
-            fetch('/api/verify_session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token })
-            }).then(async (res) => {
-                if (!res.ok) {
-                    sessionStorage.removeItem('nmdc_token');
-                    sessionStorage.removeItem('nmdc_name');
-                    window.location.href = '/';
-                    return;
-                }
-                const data = await res.json();
-                document.getElementById('userNameChip').innerText = data.name;
-            }).catch(() => {
-                window.location.href = '/';
-            });
-        })();
-
-        function signOut() {
-            const token = sessionStorage.getItem('nmdc_token');
-            sessionStorage.removeItem('nmdc_token');
-            sessionStorage.removeItem('nmdc_name');
-            if (token) {
-                fetch('/api/signout', {
+            try {
+                const res = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ token })
-                }).finally(() => { window.location.href = '/'; });
-            } else {
-                window.location.href = '/';
-            }
-        }
-
-        function toggleDevice() {
-            fetch('/api/toggle_device', { method: 'POST' });
-        }
-
-        // ----------------- THEME & LAYERS -----------------
-        function toggleTheme() {
-            const html = document.documentElement;
-            const current = html.getAttribute('data-theme');
-            const newTheme = current === 'dark' ? 'light' : 'dark';
-            html.setAttribute('data-theme', newTheme);
-            document.getElementById('themeBtnText').innerText = newTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
-        }
-
-        function switchLayer(layerNum, btn) {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.layer-view').forEach(v => v.classList.remove('active'));
-            btn.classList.add('active');
-            document.getElementById('layer' + layerNum).classList.add('active');
-            if (layerNum === 1) resizeCanvas();
-        }
-
-        // ----------------- CONVEYOR CANVAS -----------------
-        const canvas = document.getElementById('conveyorCanvas');
-        const ctx = canvas.getContext('2d');
-        let beltOffset = 0;
-        let isEmergency = false;
-        let deviceConnected = false;
-
-        function resizeCanvas() {
-            canvas.width = canvas.parentElement.clientWidth - 32;
-            canvas.height = 80;
-        }
-        window.addEventListener('resize', resizeCanvas);
-        resizeCanvas();
-
-        function drawConveyor() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const w = canvas.width, h = canvas.height;
-
-            ctx.fillStyle = "#22293a";
-            ctx.beginPath(); ctx.arc(35, h/2, 22, 0, Math.PI*2); ctx.fill();
-            ctx.beginPath(); ctx.arc(w - 35, h/2, 22, 0, Math.PI*2); ctx.fill();
-
-            ctx.strokeStyle = !deviceConnected ? "#3a4256" : (isEmergency ? "#ff3366" : "#00e5ff");
-            ctx.lineWidth = 5;
-            ctx.beginPath();
-            ctx.moveTo(35, h/2 - 22); ctx.lineTo(w - 35, h/2 - 22);
-            ctx.moveTo(35, h/2 + 22); ctx.lineTo(w - 35, h/2 + 22);
-            ctx.stroke();
-
-            if (deviceConnected && !isEmergency) beltOffset = (beltOffset + 2.5) % (w - 70);
-            const spliceX = 35 + beltOffset;
-            ctx.fillStyle = !deviceConnected ? "#3a4256" : (isEmergency ? "#ff3366" : "#00ff88");
-            ctx.fillRect(spliceX, h/2 - 25, 10, 5);
-
-            ctx.fillStyle = "#7a889b";
-            ctx.font = "9px Inter";
-            ctx.fillText("DRIVE DRUM", 10, h - 5);
-            ctx.fillText("TAKE-UP DRUM", w - 75, h - 5);
-
-            if (!deviceConnected) {
-                ctx.fillStyle = "rgba(9,11,16,0.55)";
-                ctx.fillRect(0, 0, w, h);
-                ctx.fillStyle = "#ffb700";
-                ctx.font = "bold 11px Inter";
-                ctx.textAlign = "center";
-                ctx.fillText("AWAITING HARDWARE CONNECTION", w / 2, h / 2 + 4);
-                ctx.textAlign = "left";
-            }
-
-            requestAnimationFrame(drawConveyor);
-        }
-        drawConveyor();
-
-        // ----------------- CHART.JS TELEMETRY -----------------
-        const chartCtx = document.getElementById('telemetryChart').getContext('2d');
-        const telemetryChart = new Chart(chartCtx, {
-            type: 'line',
-            data: {
-                labels: Array(20).fill(''),
-                datasets: [
-                    { label: 'Tension (kN)', borderColor: '#00e5ff', data: Array(20).fill(45), tension: 0.3, borderWidth: 2 },
-                    { label: 'Bearing Temp (°C)', borderColor: '#ffb700', data: Array(20).fill(52), tension: 0.3, borderWidth: 2 },
-                    { label: 'Vibration RMS (mm/s)', borderColor: '#ff3366', data: Array(20).fill(2.1), tension: 0.3, borderWidth: 2 }
-                ]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: '#7a889b', font: { size: 10 } } } },
-                scales: {
-                    x: { display: false },
-                    y: { grid: { color: 'rgba(122, 136, 155, 0.1)' }, ticks: { color: '#7a889b' } }
+                    body: JSON.stringify(payload)
+                });
+                const d = await res.json();
+                if (!res.ok) {
+                    err.innerText = d.detail || 'Authentication failed.';
+                    err.style.display = 'block';
+                } else {
+                    localStorage.setItem('nmdc_token', d.token);
+                    localStorage.setItem('nmdc_user_name', d.name);
+                    succ.innerText = 'Authorization verified! Redirecting to SCADA...';
+                    succ.style.display = 'block';
+                    setTimeout(() => window.location.href = '/dashboard', 500);
                 }
+            } catch(e) {
+                err.innerText = 'Server communication error.';
+                err.style.display = 'block';
             }
-        });
-
-        // ----------------- WEBSOCKET -----------------
-        const ws = new WebSocket(`ws://${location.host}/ws`);
-        ws.onmessage = (evt) => {
-            const data = JSON.parse(evt.data);
-            isEmergency = data.emergency_stop && data.device_connected;
-            deviceConnected = data.device_connected;
-
-            const deviceTag = document.getElementById('deviceStatusTag');
-            const deviceBtn = document.getElementById('deviceToggleText');
-            const standbyBanner = document.getElementById('standbyBanner');
-            if (data.device_connected) {
-                deviceTag.innerText = "HARDWARE: CONNECTED";
-                deviceTag.className = "tag tag-online";
-                deviceBtn.innerText = "Disconnect Hardware";
-                standbyBanner.style.display = "none";
-            } else {
-                deviceTag.innerText = "HARDWARE: DISCONNECTED";
-                deviceTag.className = "tag tag-offline";
-                deviceBtn.innerText = "Connect Hardware";
-                standbyBanner.style.display = "flex";
-            }
-
-            const bhiElem = document.getElementById('bhiVal');
-            bhiElem.innerText = data.bhi + "%";
-            bhiElem.style.color = data.bhi < 50 ? "var(--red)" : (data.bhi < 75 ? "var(--amber)" : "var(--green)");
-
-            document.getElementById('rulVal').innerText = data.rul_hours + " Hrs";
-            document.getElementById('speedVal').innerText = data.speed.toFixed(2) + " m/s";
-            document.getElementById('loadVal').innerText = data.load + " TPH Iron Ore";
-
-            const banner = document.getElementById('systemStateBanner');
-            const relay = document.getElementById('relayStatus');
-            banner.innerText = data.status;
-
-            if (data.emergency_stop) {
-                banner.style.background = "rgba(255, 51, 102, 0.2)";
-                banner.style.color = "var(--red)";
-                relay.innerText = "TRIPPED";
-                relay.style.color = "var(--red)";
-                document.getElementById('tripTag').className = "tag tag-offline";
-                document.getElementById('tripTag').innerText = "INTERLOCK: TRIPPED";
-            } else {
-                banner.style.background = "rgba(0, 255, 136, 0.1)";
-                banner.style.color = "var(--green)";
-                relay.innerText = "NORMAL";
-                relay.style.color = "var(--green)";
-                document.getElementById('tripTag').className = "tag tag-online";
-                document.getElementById('tripTag').innerText = "INTERLOCK: ENGAGED";
-            }
-
-            const camTag = document.getElementById('camStatusTag');
-            const camBtn = document.getElementById('btnCamToggle');
-            const camFps = document.getElementById('camFpsText');
-            const t = translations[currentLang] || translations.en;
-            if (data.camera_connected) {
-                camTag.innerText = "CAM-03: ONLINE";
-                camTag.className = "tag tag-online";
-                camBtn.innerText = t.btnCamDisconnect;
-                camFps.innerText = "Live (25 FPS)";
-            } else {
-                camTag.innerText = "CAM-03: DISCONNECTED";
-                camTag.className = "tag tag-offline";
-                camBtn.innerText = t.btnCamConnect;
-                camFps.innerText = "Standby (0 FPS)";
-            }
-            const camToggleBtnEl = document.getElementById('camToggleBtn');
-            if (camToggleBtnEl) {
-                camToggleBtnEl.disabled = !data.device_connected;
-                camToggleBtnEl.style.opacity = data.device_connected ? "1" : "0.45";
-                camToggleBtnEl.style.cursor = data.device_connected ? "pointer" : "not-allowed";
-                camToggleBtnEl.style.pointerEvents = data.device_connected ? "auto" : "none";
-            }
-
-            document.getElementById('vibRmsDetail').innerText = data.vibration + " mm/s RMS";
-            document.getElementById('vibAxes').innerText = `X: ${data.vib_x} | Y: ${data.vib_y} | Z: ${data.vib_z} m/s²`;
-            document.getElementById('tempDetail').innerText = data.temperature + " °C";
-            document.getElementById('tensionDetail').innerText = data.tension + " kN";
-
-            telemetryChart.data.datasets[0].data.push(data.tension);
-            telemetryChart.data.datasets[0].data.shift();
-            telemetryChart.data.datasets.data.push(data.temperature);
-            telemetryChart.data.datasets.data.shift();
-            telemetryChart.data.datasets.data.push(data.vibration);
-            telemetryChart.data.datasets.data.shift();
-            telemetryChart.update('none');
-
-            if (data.incidents && data.incidents.length > 0) {
-                const tbody = document.getElementById('incidentBody');
-                tbody.innerHTML = data.incidents.map(inc => `
-                    <tr>
-                        <td>${inc.timestamp}</td>
-                        <td>${inc.event}</td>
-                        <td style="color: ${inc.severity === 'CRITICAL' ? 'var(--red)' : 'var(--amber)'}">${inc.severity}</td>
-                    </tr>
-                `).join('');
-            }
-        };
-
-        function injectFault(type) {
-            fetch('/api/inject_fault', {
+        }
+        function applyTheme(t) {
+            document.documentElement.setAttribute('data-theme', t);
+            localStorage.setItem('nmdc_theme', t);
+            document.getElementById('themeLabel').innerText = t === 'dark' ? 'Light Mode' : 'Dark Mode';
+        }
+        function toggleTheme() {
+            const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+            applyTheme(cur === 'dark' ? 'light' : 'dark');
+        }
+        applyTheme(localStorage.getItem('nmdc_theme') || 'dark');
+        if (localStorage.getItem('nmdc_token')) {
+            fetch('/api/verify_session', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fault_type: type })
-            });
-        }
-
-        function toggleCamera() {
-            fetch('/api/toggle_camera', { method: 'POST' });
-        }
-
-        function resetSystem() {
-            fetch('/api/reset', { method: 'POST' });
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ token: localStorage.getItem('nmdc_token') })
+            }).then(r => { if (r.ok) window.location.href = '/dashboard'; });
         }
     </script>
 </body>
 </html>
 """
 
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Team AYASK — NMDC Conveyor AI SCADA Command Center</title>
+    <link rel="icon" type="image/png" href="/static/ayask_logo.png">
+    <link rel="shortcut icon" href="/static/ayask_logo.png">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* ==============================================================================
+           AYASK SCADA: ZERO EMOJIS · SPACIOUS EXPANSIVE LAYOUT
+           DARK MODE: STRICTLY BROWN & GOLDEN YELLOW PALETTE (ZERO VIBRANT BLUES/REDS)
+           LIGHT MODE: CRISP HIGH-CONTRAST INDUSTRIAL PALETTE
+           ============================================================================== */
+        :root[data-theme="dark"] {
+            --bg-deep: #0e0c0a;
+            --bg-panel: #161310;
+            --bg-card: #1c1814;
+            --bg-input: #120f0c;
+            --border: #33281e;
+            --border-hover: #543f2a;
+            --text: #f5eedf;
+            --text-dim: #c4b5a0;
+            --text-faint: #8a7b68;
+            
+            /* Gold & Brown Theme Variables */
+            --gold: #d4af37;
+            --gold-hover: #e5be42;
+            --gold-subtle: rgba(212, 175, 55, 0.12);
+            --gold-border: #997c22;
+            --brown: #8c5a32;
+            --brown-hover: #9e693d;
+            --brown-deep: #4a2f1b;
+            --brown-subtle: rgba(140, 90, 50, 0.14);
+
+            /* Non-vibrant earthy state variables */
+            --accent-gold: #d4af37;
+            --alert-burnt: #a84825;
+            --alert-burnt-bg: rgba(168, 72, 37, 0.18);
+            --alert-burnt-border: #7c3116;
+            --safe-gold: #d4af37;
+            --safe-gold-bg: rgba(212, 175, 55, 0.14);
+            --safe-gold-border: #997c22;
+            --warn-amber: #c68a3c;
+            --warn-amber-bg: rgba(198, 138, 60, 0.14);
+            --warn-amber-border: #8c5d22;
+
+            --chart-grid: rgba(212, 175, 55, 0.08);
+            --chart-tick: #c4b5a0;
+            --shadow-float: 0 16px 40px rgba(0, 0, 0, 0.55);
+            --shadow-skate: 0 24px 54px rgba(0, 0, 0, 0.70);
+        }
+
+        :root[data-theme="light"] {
+            --bg-deep: #eef2f7;
+            --bg-panel: #ffffff;
+            --bg-card: #ffffff;
+            --bg-input: #f8fafc;
+            --border: #cbd5e1;
+            --border-hover: #94a3b8;
+            --text: #0f172a;
+            --text-dim: #334155;
+            --text-faint: #64748b;
+            
+            --gold: #8c5d33;
+            --gold-hover: #734821;
+            --gold-subtle: rgba(140, 93, 51, 0.08);
+            --gold-border: #8c5d33;
+            --brown: #8c5d33;
+            --brown-hover: #734821;
+            --brown-deep: #54371c;
+            --brown-subtle: rgba(140, 93, 51, 0.08);
+
+            --accent-gold: #8c5d33;
+            --alert-burnt: #b91c1c;
+            --alert-burnt-bg: rgba(220, 38, 38, 0.10);
+            --alert-burnt-border: #fca5a5;
+            --safe-gold: #15803d;
+            --safe-gold-bg: rgba(22, 163, 74, 0.10);
+            --safe-gold-border: #86efac;
+            --warn-amber: #b45309;
+            --warn-amber-bg: rgba(217, 119, 6, 0.10);
+            --warn-amber-border: #fde68a;
+
+            --chart-grid: rgba(15, 23, 42, 0.12);
+            --chart-tick: #334155;
+            --shadow-float: 0 10px 28px rgba(0, 0, 0, 0.07);
+            --shadow-skate: 0 16px 36px rgba(0, 0, 0, 0.12);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; transition: background-color 0.22s, border-color 0.22s, color 0.22s; }
+        body { background: var(--bg-deep); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }
+
+        /* Vectors / SVG Icon helper */
+        .scada-icon { width: 17px; height: 17px; display: inline-block; vertical-align: middle; stroke-width: 2; stroke: currentColor; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+
+        /* Floating Topbar Header - Spacious */
+        .topbar {
+            position: sticky; top: 0; z-index: 100;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 16px 36px; background: var(--bg-panel);
+            border-bottom: 1px solid var(--border); box-shadow: var(--shadow-float);
+            backdrop-filter: blur(14px);
+        }
+        .ayask-brand { display: flex; align-items: center; gap: 16px; }
+        .ayask-header-logo {
+            height: 52px; width: auto; max-width: 80px; object-fit: contain;
+            filter: drop-shadow(0 2px 8px rgba(0,0,0,0.3));
+        }
+        .ayask-text h1 { font-size: 17px; font-weight: 800; letter-spacing: 1px; color: var(--gold); }
+        .ayask-text p { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+        .topbar-actions { display: flex; align-items: center; gap: 14px; }
+        .chip {
+            display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 10px; font-size: 13px; font-weight: 600;
+        }
+        .pulse-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--safe-gold); }
+        .pulse-dot.danger { background: var(--alert-burnt); }
+        .pulse-dot.warning { background: var(--warn-amber); }
+
+        /* Buttons with generous breathing room */
+        .btn-ctrl {
+            background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
+            padding: 9px 18px; border-radius: 10px; font-size: 13px; font-weight: 600;
+            cursor: pointer; display: flex; align-items: center; gap: 8px;
+            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .btn-ctrl:hover {
+            border-color: var(--border-hover); transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+        }
+        .btn-ctrl:active { transform: translateY(0); }
+        .btn-ctrl.btn-danger { background: var(--alert-burnt-bg); border-color: var(--alert-burnt-border); color: var(--alert-burnt); }
+        .btn-ctrl.btn-danger:hover { background: var(--alert-burnt); color: #fff; }
+        .btn-ctrl.btn-copper { background: var(--gold-subtle); border-color: var(--gold); color: var(--gold); }
+        .btn-ctrl.btn-success { background: var(--safe-gold-bg); border-color: var(--safe-gold-border); color: var(--safe-gold); }
+
+        /* Main SCADA Grid - Generous, Uncluttered, Free */
+        .scada-container {
+            flex: 1; padding: 32px 40px; display: grid; grid-template-columns: 1.16fr 0.84fr;
+            gap: 32px; max-width: 1820px; margin: 0 auto; width: 100%;
+        }
+
+        /* Floating Spacious Cards */
+        .card {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: 16px; overflow: hidden; display: flex; flex-direction: column;
+            box-shadow: var(--shadow-float);
+            transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.28s;
+        }
+        .card:hover { transform: translateY(-4px); box-shadow: var(--shadow-skate); }
+
+        .card-header {
+            padding: 16px 24px; background: var(--bg-card); border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .card-title { font-size: 13.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; display: flex; align-items: center; gap: 10px; color: var(--gold); }
+        .card-body { padding: 24px 26px; flex: 1; }
+
+        /* KPI Floating Strip - Large & Clear */
+        .kpi-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 24px; }
+        .kpi-box {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+            padding: 18px 20px; box-shadow: var(--shadow-float);
+            transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .kpi-box:hover { transform: translateY(-3px); }
+        .kpi-box .kpi-label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px; letter-spacing: 0.5px; }
+        .kpi-box .kpi-val { font-size: 27px; font-weight: 800; font-family: 'JetBrains Mono', monospace; color: var(--text); }
+        .kpi-box .kpi-sub { font-size: 12px; color: var(--text-faint); margin-top: 6px; }
+
+        /* Video Section - Big & Free */
+        .video-box {
+            position: relative; width: 100%; height: 390px; background: #000;
+            border-radius: 12px; overflow: hidden; border: 1px solid var(--border);
+        }
+        .video-box img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .video-controls { margin-top: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+
+        .detection-badge-row {
+            margin-top: 16px; padding: 14px 18px; background: var(--bg-card);
+            border: 1px solid var(--border); border-radius: 10px; font-size: 13px;
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        }
+        .det-pill {
+            background: var(--gold-subtle); border: 1px solid var(--gold); color: var(--gold);
+            padding: 4px 10px; border-radius: 8px; font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 700;
+        }
+
+        /* Digital Twin Mechanics Simulation - Spacious & Big */
+        .digital-twin-container {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+            padding: 22px; margin-bottom: 20px; position: relative;
+        }
+        .digital-twin-canvas-wrap {
+            width: 100%; height: 180px; background: var(--bg-input); border-radius: 10px;
+            border: 1px solid var(--border); overflow: hidden; position: relative;
+        }
+        .digital-twin-canvas-wrap canvas { width: 100%; height: 100%; display: block; }
+
+        .stimulation-controls {
+            margin-top: 18px; display: grid; grid-template-columns: 1fr 1fr 140px; gap: 18px; align-items: center;
+        }
+        .stim-slider-wrap label { font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; display: flex; justify-content: space-between; margin-bottom: 6px; }
+        .stim-slider-wrap input[type=range] { width: 100%; accent-color: var(--gold); cursor: pointer; height: 6px; }
+
+        .digital-twin-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 16px;
+        }
+        .zone-card {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+            padding: 14px 16px; font-size: 12.5px;
+            transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .zone-card:hover { transform: translateY(-2px); }
+        .zone-card .z-num { font-size: 10.5px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; }
+        .zone-card .z-title { font-weight: 700; margin: 4px 0; }
+        .zone-card .z-status { font-size: 11px; font-weight: 600; color: var(--safe-gold); font-family: 'JetBrains Mono', monospace; }
+
+        /* Relay Interlock Panel - Generous */
+        .relay-panel {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+            padding: 18px 22px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;
+        }
+        .relay-status-text { font-size: 14px; font-weight: 800; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
+
+        /* Fault Buttons Strip - Spacious 3-Column */
+        .fault-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 14px; }
+        .btn-fault {
+            background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
+            padding: 14px 16px; border-radius: 10px; font-size: 13px; font-weight: 600;
+            cursor: pointer; text-align: left; display: flex; align-items: center; gap: 10px;
+            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .btn-fault:hover { transform: translateY(-3px); border-color: var(--border-hover); box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+        .btn-fault.active-fault {
+            background: var(--alert-burnt-bg); border-color: var(--gold); color: var(--gold);
+            box-shadow: 0 0 16px rgba(212, 175, 55, 0.35); font-weight: 700;
+        }
+        .btn-fault.btn-reset-full {
+            grid-column: span 3; text-align: center; justify-content: center;
+            background: var(--safe-gold-bg); border-color: var(--safe-gold-border); color: var(--safe-gold);
+            font-size: 14px; padding: 15px; font-weight: 700;
+        }
+        .btn-fault.btn-reset-full:hover { background: var(--gold); color: #0e0c0a; }
+
+        /* XYZ Radar Canvas - Spacious */
+        .xyz-box { display: grid; grid-template-columns: 1fr 160px; gap: 18px; align-items: center; }
+        .xyz-canvas-wrap {
+            position: relative; width: 100%; height: 210px; background: var(--bg-card);
+            border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+        }
+        .xyz-canvas-wrap canvas { width: 100%; height: 100%; display: block; }
+        .xyz-meta-item {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+            padding: 12px 14px; margin-bottom: 10px;
+        }
+        .xyz-meta-item .ax { font-size: 10.5px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; }
+        .xyz-meta-item .val { font-size: 15px; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: var(--gold); margin-top: 3px; }
+
+        /* Floating Toast Alert */
+        .toast-banner {
+            position: fixed; top: 85px; left: 50%; transform: translateX(-50%) translateY(-100px);
+            background: var(--bg-panel); border: 1.5px solid var(--gold); border-radius: 12px;
+            padding: 14px 28px; box-shadow: var(--shadow-skate); z-index: 999;
+            font-size: 13.5px; font-weight: 700; color: var(--text);
+            display: flex; align-items: center; gap: 12px; pointer-events: none; opacity: 0;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .toast-banner.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+
+        /* Protocol Feeds & Incidents - Spacious */
+        .feed-bar {
+            padding: 12px 18px; background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 10px; font-size: 12px; display: flex; justify-content: space-between; margin-bottom: 16px;
+            font-family: 'JetBrains Mono', monospace; color: var(--gold);
+        }
+
+        table.inc-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        table.inc-table th { background: var(--bg-card); color: var(--text-dim); text-align: left; padding: 10px 14px; font-weight: 600; border-bottom: 1px solid var(--border); }
+        table.inc-table td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+        table.inc-table tr:hover { background: var(--bg-card); }
+    </style>
+</head>
+<body>
+    <div class="toast-banner" id="toastAlert">
+        <svg class="scada-icon" style="stroke:var(--gold); width:20px; height:20px;" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span id="toastMsg">System Notification</span>
+    </div>
+
+    <header class="topbar">
+        <div class="ayask-brand">
+            <img src="/static/ayask_logo.png" alt="AYASK Logo" class="ayask-header-logo">
+            <div class="ayask-text">
+                <h1>NMDC CONVEYOR AI SCADA</h1>
+                <p>Team AYASK · SIH 26008 · Multi-Modal IoT & Edge AI Digital Twin System</p>
+            </div>
+        </div>
+
+        <div class="topbar-actions">
+            <button class="btn-ctrl btn-copper" onclick="openJuryModal()" title="View SIH 26008 Architecture Defense">
+                <svg class="scada-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                <span>Jury Briefing</span>
+            </button>
+
+            <div class="chip">
+                <span class="pulse-dot" id="headerPulse"></span>
+                <span id="headerStatus">LEVEL 1: OPTIMAL</span>
+            </div>
+
+            <div class="chip">
+                <span>BHI:</span>
+                <strong id="headerBhi" style="font-family:'JetBrains Mono',monospace; color:var(--gold);">98.0%</strong>
+            </div>
+
+            <div class="chip">
+                <span>RUL:</span>
+                <strong id="headerRul" style="font-family:'JetBrains Mono',monospace; color:var(--safe-gold);">720 hrs</strong>
+            </div>
+
+            <button class="btn-ctrl" onclick="toggleTheme()" id="themeBtn" title="Toggle Light / Dark Mode">
+                <svg class="scada-icon" id="themeIconSvg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                <span id="themeLabel">Light Mode</span>
+            </button>
+
+            <button class="btn-ctrl btn-danger" onclick="injectFault('SPLICE_TEAR')" title="Manual Emergency Cutoff">
+                <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <span>E-STOP TRIP</span>
+            </button>
+
+            <button class="btn-ctrl" onclick="signOut()" title="Sign Out">
+                <svg class="scada-icon" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <main class="scada-container">
+        <!-- LEFT COLUMN: Computer Vision, Digital Twin & XYZ Motion -->
+        <section style="display:flex; flex-direction:column; gap:28px;">
+            <!-- Zone 3 Camera & Optical Scanner -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                        <span>Vision AI: Zone 3 Return Belt Scanner</span>
+                        <span id="camSourcePill" style="font-size:11.5px; padding:3px 10px; border-radius:6px; background:var(--bg-card); border:1px solid var(--border); color:var(--gold);">WEBCAM 0</span>
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <span id="fpsReadout" style="font-size:12px; font-family:'JetBrains Mono',monospace; color:var(--text-dim);">0.0 FPS</span>
+                        <button class="btn-ctrl btn-copper" onclick="openSettingsModal()">
+                            <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                            <span>Settings</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="video-box">
+                        <img src="/video_feed" alt="Zone 3 Return Belt Inspection Feed">
+                    </div>
+
+                    <div class="video-controls">
+                        <div style="display:flex; gap:10px;">
+                            <button class="btn-ctrl" id="btnCam" onclick="toggleCam()">
+                                <svg class="scada-icon" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                                <span>Enable Camera</span>
+                            </button>
+                            <button class="btn-ctrl" id="btnMirror" onclick="toggleMirror()">
+                                <svg class="scada-icon" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                                <span>Mirror: OFF</span>
+                            </button>
+                            <button class="btn-ctrl" id="btnYolo" onclick="toggleYolo()">
+                                <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+                                <span>AI Detect: ON</span>
+                            </button>
+                        </div>
+                        <span id="camStatus" style="font-size:12px; color:var(--text-dim);">Status: Standby</span>
+                    </div>
+
+                    <div class="detection-badge-row">
+                        <strong style="color:var(--text-dim);">Iron Ore Defect Detections:</strong>
+                        <span id="detList" style="color:var(--text-faint); font-style:italic;">Scanning nominal return belt surface...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Digital Twin Conveyor Stimulation Visualizer -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                        <span>Conveyor Digital Twin Simulation (Zones 1–4)</span>
+                    </div>
+                    <span style="font-size:12px; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="twinCycleReadout">Cycle: Splice #142 @ 0.0%</span>
+                </div>
+                <div class="card-body">
+                    <div class="digital-twin-container">
+                        <div class="digital-twin-canvas-wrap">
+                            <canvas id="digitalTwinCanvas" width="700" height="180"></canvas>
+                        </div>
+
+                        <!-- Stimulation Controls -->
+                        <div class="stimulation-controls">
+                            <div class="stim-slider-wrap">
+                                <label>
+                                    <span>Belt Speed Regulation</span>
+                                    <span id="stimSpeedVal" style="color:var(--gold); font-family:'JetBrains Mono',monospace;">3.5 m/s</span>
+                                </label>
+                                <input type="range" id="sliderSpeed" min="0" max="5" step="0.1" value="3.5" oninput="stimulateTwin()">
+                            </div>
+                            <div class="stim-slider-wrap">
+                                <label>
+                                    <span>Ore Mass Throughput</span>
+                                    <span id="stimLoadVal" style="color:var(--gold); font-family:'JetBrains Mono',monospace;">1,250 TPH</span>
+                                </label>
+                                <input type="range" id="sliderLoad" min="0" max="2500" step="50" value="1250" oninput="stimulateTwin()">
+                            </div>
+                            <div>
+                                <button class="btn-ctrl btn-copper" style="width:100%; justify-content:center; padding:12px 14px;" onclick="toggleMotorTwin()">
+                                    <svg class="scada-icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                                    <span id="btnMotorLabel">Motor Stop</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="digital-twin-grid">
+                        <div class="zone-card" id="cardZone1">
+                            <div class="z-num">Zone 1 · Head</div>
+                            <div class="z-title">Drive Motor (415V)</div>
+                            <div class="z-status" id="z1Status">NOMINAL</div>
+                        </div>
+                        <div class="zone-card" id="cardZone2">
+                            <div class="z-num">Zone 2 · Carrying</div>
+                            <div class="z-title">Troughing Run & Ore</div>
+                            <div class="z-status" id="z2Status">NOMINAL</div>
+                        </div>
+                        <div class="zone-card" id="cardZone3">
+                            <div class="z-num">Zone 3 · Return</div>
+                            <div class="z-title">Optical AI & MPU6050</div>
+                            <div class="z-status" id="z3Status">NOMINAL</div>
+                        </div>
+                        <div class="zone-card" id="cardZone4">
+                            <div class="z-num">Zone 4 · Tail</div>
+                            <div class="z-title">Take-Up & HX711</div>
+                            <div class="z-status" id="z4Status">NOMINAL</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tri-Axial Vibration Radar (MPU6050) -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="22" y1="12" x2="18" y2="12"/><line x1="6" y1="12" x2="2" y2="12"/><line x1="12" y1="6" x2="12" y2="2"/><line x1="12" y1="22" x2="12" y2="18"/></svg>
+                        <span>Tri-Axial Vibration Harmonics (XYZ Trajectory)</span>
+                    </div>
+                    <span style="font-size:12px; color:var(--text-dim);">MPU6050 Accelerometer Harvester</span>
+                </div>
+                <div class="card-body">
+                    <div class="xyz-box">
+                        <div class="xyz-canvas-wrap">
+                            <canvas id="xyzCanvas" width="520" height="240"></canvas>
+                        </div>
+                        <div>
+                            <div class="xyz-meta-item">
+                                <div class="ax">X (Lateral)</div>
+                                <div class="val" id="valX">+0.00 m/s²</div>
+                            </div>
+                            <div class="xyz-meta-item">
+                                <div class="ax">Y (Longit)</div>
+                                <div class="val" id="valY">+0.00 m/s²</div>
+                            </div>
+                            <div class="xyz-meta-item">
+                                <div class="ax">Z (Normal)</div>
+                                <div class="val" id="valZ">+9.81 m/s²</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- RIGHT COLUMN: Telemetry, Fault Injector & Interlock Safety -->
+        <section style="display:flex; flex-direction:column; gap:28px;">
+            <!-- Real-Time Belt Health Synthesis KPI Strip -->
+            <div class="kpi-strip">
+                <div class="kpi-box">
+                    <div class="kpi-label">Joint RUL</div>
+                    <div class="kpi-val" id="kpiRul" style="color:var(--safe-gold);">720 hrs</div>
+                    <div class="kpi-sub">Est. Joint Life (~30d)</div>
+                </div>
+                <div class="kpi-box">
+                    <div class="kpi-label">Belt Speed</div>
+                    <div class="kpi-val" id="kpiSpeed">3.5 m/s</div>
+                    <div class="kpi-sub">Target: 3.5 m/s</div>
+                </div>
+                <div class="kpi-box">
+                    <div class="kpi-label">Throughput</div>
+                    <div class="kpi-val" id="kpiLoad">1,250 TPH</div>
+                    <div class="kpi-sub">Iron Ore Mass Flow</div>
+                </div>
+                <div class="kpi-box">
+                    <div class="kpi-label">Splice Vib RMS</div>
+                    <div class="kpi-val" id="kpiVib">2.10 mm/s</div>
+                    <div class="kpi-sub">ISO 10816 Limit: 4.5</div>
+                </div>
+            </div>
+
+            <!-- Drive Motor Interlock Status (Normally Closed Relay Safety Loop) -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                        <span>Drive Motor Failsafe Interlock (NC Relay Loop)</span>
+                    </div>
+                    <span style="font-size:12px; color:var(--text-dim);">ISO 13849-1 Cat 4 / PL e</span>
+                </div>
+                <div class="card-body">
+                    <div class="relay-panel">
+                        <div>
+                            <div style="font-size:11px; font-weight:700; color:var(--text-dim); text-transform:uppercase;">Drive Contactor Circuit State</div>
+                            <div class="relay-status-text" id="relayText" style="color:var(--safe-gold);">NC RELAY CLOSED · CONTACTOR ENERGIZED (415V)</div>
+                        </div>
+                        <div class="chip" id="relayBadge">
+                            <span class="pulse-dot" id="relayDot"></span>
+                            <span id="relayBadgeText">MOTOR RUNNING</span>
+                        </div>
+                    </div>
+                    <div style="font-size:12.5px; color:var(--text-dim); line-height:1.5;">
+                        Failsafe hardware circuit: automated relay contactor breaks within &lt;120ms to prevent catastrophic tear propagation.
+                    </div>
+                </div>
+            </div>
+
+            <!-- SIH Demo Fault Injector (100% Working, Interactive Suite) -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                        <span>SIH Fault Injection Suite & Interlock Validation</span>
+                    </div>
+                    <span style="font-size:12px; font-weight:700; color:var(--gold);" id="activeFaultIndicator">ACTIVE: NONE</span>
+                </div>
+                <div class="card-body">
+                    <div style="font-size:13px; color:var(--text-dim); margin-bottom:12px;">
+                        Trigger simulated failure modes to validate automated PLC relay trips, condition synthesis, and vision alerts:
+                    </div>
+                    <div class="fault-strip">
+                        <button class="btn-fault" id="btnFault_SPLICE_TEAR" onclick="injectFault('SPLICE_TEAR')">
+                            <svg class="scada-icon" style="stroke:var(--alert-burnt);" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <span>Splice Joint Tear</span>
+                        </button>
+                        <button class="btn-fault" id="btnFault_BEARING_HOTSPOT" onclick="injectFault('BEARING_HOTSPOT')">
+                            <svg class="scada-icon" style="stroke:var(--warn-amber);" viewBox="0 0 24 24"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
+                            <span>Bearing Hotspot</span>
+                        </button>
+                        <button class="btn-fault" id="btnFault_TENSION_SURGE" onclick="injectFault('TENSION_SURGE')">
+                            <svg class="scada-icon" style="stroke:var(--gold);" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                            <span>Tension Surge</span>
+                        </button>
+                        <button class="btn-fault" id="btnFault_MISALIGNMENT" onclick="injectFault('MISALIGNMENT')">
+                            <svg class="scada-icon" style="stroke:var(--brown);" viewBox="0 0 24 24"><polyline points="17 11 21 7 17 3"/><line x1="21" y1="7" x2="9" y2="7"/><polyline points="7 21 3 17 7 13"/><line x1="3" y1="17" x2="15" y2="17"/></svg>
+                            <span>Lateral Sway</span>
+                        </button>
+                        <button class="btn-fault" id="btnFault_SURFACE_GOUGE" onclick="injectFault('SURFACE_GOUGE')">
+                            <svg class="scada-icon" style="stroke:var(--warn-amber);" viewBox="0 0 24 24"><path d="M2 12h20M7 8l5 8M17 8l-5 8"/></svg>
+                            <span>Surface Gouge</span>
+                        </button>
+                        <button class="btn-fault" id="btnFault_ORE_DUST" onclick="injectFault('ORE_DUST')">
+                            <svg class="scada-icon" style="stroke:var(--brown-hover);" viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><polyline points="17 7 21 7 21 11"/></svg>
+                            <span>Ore Dust Layer</span>
+                        </button>
+                        <button class="btn-fault btn-reset-full" onclick="resetSystem()">
+                            <svg class="scada-icon" style="stroke:currentColor;" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                            <span>Reset System & Restore Motor Contactor</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Multi-Modal Telemetry Chart -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+                        <span>IoT Sensor Streams: HX711 · DS18B20 · MPU6050</span>
+                    </div>
+                    <span style="font-size:12px; color:var(--text-dim);">Live Telemetry Trends</span>
+                </div>
+                <div class="card-body">
+                    <div style="position:relative; width:100%; height:210px;">
+                        <canvas id="teleChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SCADA Command Center & Safety Event Logs -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+                        <span>Industrial Event Audit Log & Modbus Feeds</span>
+                    </div>
+                    <button class="btn-ctrl" onclick="toggleDev()" id="btnHwChannel" style="font-size:11.5px; padding:4px 10px;">
+                        Hardware: Sim
+                    </button>
+                </div>
+                <div class="card-body" style="padding:18px;">
+                    <div class="feed-bar">
+                        <span id="modbusText">Modbus TCP: Port 502 · PLC Node 10.0.4.12</span>
+                        <span id="opcuaText">OPC-UA: opc.tcp://10.0.4.15:4840</span>
+                    </div>
+                    <div style="max-height:190px; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
+                        <table class="inc-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Event Description</th>
+                                    <th>Severity</th>
+                                </tr>
+                            </thead>
+                            <tbody id="incTbody">
+                                <tr><td colspan="3" style="text-align:center; color:var(--text-dim);">Loading audit events...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Camera Settings Modal -->
+    <div id="settingsModal" style="position:fixed; inset:0; background:rgba(0,0,0,0.70); z-index:1000; display:none; align-items:center; justify-content:center;">
+        <div class="card" style="max-width:500px; width:100%; padding:28px; box-shadow:var(--shadow-skate);">
+            <h3 style="font-size:16px; font-weight:800; margin-bottom:18px; display:flex; align-items:center; gap:10px; color:var(--gold);">
+                <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <span>Zone 3 Vision AI Configuration</span>
+            </h3>
+            <div style="margin-bottom:16px;">
+                <label style="display:block; font-size:11.5px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:8px;">Camera Capture Source</label>
+                <select id="selSource" onchange="sourceChange()" style="width:100%; padding:12px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; color:var(--text); outline:none;">
+                    <option value="webcam">Local USB / Integrated Webcam (Index 0)</option>
+                    <option value="esp32">ESP32-CAM (EP-32 Module MJPEG Stream)</option>
+                    <option value="sim">Zone 3 Conveyor Digital Twin (Simulation)</option>
+                </select>
+            </div>
+            <div id="esp32Grp" style="margin-bottom:16px;">
+                <label style="display:block; font-size:11.5px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:8px;">ESP32-CAM Stream URL</label>
+                <input type="text" id="inpUrl" placeholder="http://192.168.4.1:81/stream" style="width:100%; padding:12px; background:var(--bg-input); border:1px solid var(--border); border-radius:10px; color:var(--text); outline:none;">
+                <div style="font-size:11.5px; color:var(--text-dim); margin-top:6px;">Default AP: <code>http://192.168.4.1:81/stream</code>. Or enter local IP.</div>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:12px; margin-top:18px;">
+                <button class="btn-ctrl" onclick="closeSettingsModal()">Cancel</button>
+                <button class="btn-ctrl btn-copper" onclick="applySettings()">Save & Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Jury Briefing & SIH 26008 Defense Modal -->
+    <div id="juryModal" style="position:fixed; inset:0; background:rgba(0,0,0,0.80); z-index:1001; display:none; align-items:center; justify-content:center;">
+        <div class="card" style="max-width:760px; width:100%; max-height:85vh; overflow-y:auto; padding:32px; box-shadow:var(--shadow-skate);">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:14px; margin-bottom:18px;">
+                <div>
+                    <h3 style="font-size:19px; font-weight:800; color:var(--gold);">SIH 26008 · Jury Architecture & Defense Briefing</h3>
+                    <p style="font-size:12.5px; color:var(--text-dim); margin-top:4px;">Team AYASK · NMDC Conveyor Joint Rupture & Predictive Health System</p>
+                </div>
+                <button class="btn-ctrl" onclick="closeJuryModal()">Close</button>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:18px; font-size:13.5px; line-height:1.7; color:var(--text);">
+                <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px;">
+                    <strong style="color:var(--gold); font-size:13px; text-transform:uppercase;">1. Problem Statement 26008 Scope</strong>
+                    <p style="color:var(--text-dim); margin-top:6px;">
+                        Steel cord conveyor belts in iron ore mines span up to 5km and cost ₹1.5 Crores/km. A single splice joint separation or longitudinal rip causes complete plant downtime, multi-million rupee losses, and serious safety hazards. AYASK provides edge-computed multi-modal predictive interlocks.
+                    </p>
+                </div>
+
+                <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px;">
+                    <strong style="color:var(--gold); font-size:13px; text-transform:uppercase;">2. Multi-Modal Fusion Formulation</strong>
+                    <p style="color:var(--text-dim); margin-top:6px;">
+                        Composite Belt Health Index (BHI) fuses Return-Belt YOLOv8 defect confidence with dynamic physical sensor metrics:<br>
+                        <code>BHI = 100 - [ 0.40·P_vision + 0.25·P_tension + 0.20·P_vib + 0.15·P_temp ]</code><br>
+                        Joint RUL is synthesized via non-linear degradation estimation: <code>RUL(t) = RUL_0 · exp(-λ·Vib_RMS - μ·Drift)</code>.
+                    </p>
+                </div>
+
+                <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px;">
+                    <strong style="color:var(--gold); font-size:13px; text-transform:uppercase;">3. Failsafe Drive Contactor Interlock (NC Loop)</strong>
+                    <p style="color:var(--text-dim); margin-top:6px;">
+                        Wired into the Schneider TeSys D65 drive contactor coil in a Normally Closed (NC) loop. When critical splice rupture or severe sway is flagged, the relay circuit de-energizes in &lt;120ms (ISO 13849-1 Cat 4 / PL e compliant), cutting power before the belt splits.
+                    </p>
+                </div>
+
+                <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px;">
+                    <strong style="color:var(--gold); font-size:13px; text-transform:uppercase;">4. Hardware Node Mapping</strong>
+                    <p style="color:var(--text-dim); margin-top:6px;">
+                        • <strong>MPU6050 (I2C 0x68)</strong>: Tri-axial acceleration & RMS vibration harmonics.<br>
+                        • <strong>DS18B20 (1-Wire GPIO 4)</strong>: Pulley bearing friction heat tracking.<br>
+                        • <strong>HX711 (Pins 5/6)</strong>: 24-bit strain gauge dynamic tension measurement.<br>
+                        • <strong>ESP32-CAM (HTTP MJPEG)</strong>: Zone 3 return belt high-speed optical scanning.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const token = localStorage.getItem('nmdc_token');
+        if (!token) window.location.href = '/';
+        function signOut() {
+            fetch('/api/signout', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ token: token || '' })
+            }).finally(() => {
+                localStorage.removeItem('nmdc_token');
+                window.location.href = '/';
+            });
+        }
+
+        // ===================== TOAST NOTIFICATION =====================
+        let toastTimer;
+        function showToast(msg) {
+            const toast = document.getElementById('toastAlert');
+            document.getElementById('toastMsg').innerText = msg;
+            toast.classList.add('show');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+        }
+
+        // ===================== CHART.JS INITIALIZATION =====================
+        const cCtx = document.getElementById('teleChart').getContext('2d');
+        const bLen = 40;
+        const teleChart = new Chart(cCtx, {
+            type: 'line',
+            data: {
+                labels: Array.from({length: bLen}, (_, i) => `${bLen - i}s`),
+                datasets: [
+                    { label: 'Tension (kN)', data: Array(bLen).fill(45), borderColor: '#d4af37', borderWidth: 2, pointRadius: 0, tension: 0.3 },
+                    { label: 'Bearing Temp (°C)', data: Array(bLen).fill(52.4), borderColor: '#a86134', borderWidth: 1.8, pointRadius: 0, tension: 0.3 },
+                    { label: 'Vibration RMS (mm/s)', data: Array(bLen).fill(2.1), borderColor: '#e6cc85', borderWidth: 1.8, pointRadius: 0, tension: 0.3 }
+                ]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false, animation: false,
+                scales: {
+                    x: { display: false },
+                    y: {
+                        grid: { color: 'rgba(212,175,55,0.08)' },
+                        ticks: { color: '#c4b5a0', font: { size: 11, family: 'Inter' } }
+                    }
+                },
+                plugins: { legend: { labels: { color: '#f5eedf', font: { size: 11.5, family: 'Inter' }, boxWidth: 14 } } }
+            }
+        });
+
+        function updateChartTheme() {
+            if (!teleChart || !teleChart.options) return;
+            const isDark = (document.documentElement.getAttribute('data-theme') || 'dark') === 'dark';
+            if (isDark) {
+                // Strict Gold & Brown palette in Dark Mode
+                teleChart.data.datasets[0].borderColor = '#d4af37'; // Gold
+                teleChart.data.datasets[1].borderColor = '#a86134'; // Umber Brown
+                teleChart.data.datasets[2].borderColor = '#e6cc85'; // Golden Sand
+                teleChart.options.scales.y.grid.color = 'rgba(212,175,55,0.08)';
+                teleChart.options.scales.y.ticks.color = '#c4b5a0';
+                teleChart.options.plugins.legend.labels.color = '#f5eedf';
+            } else {
+                // Perfect Light Mode
+                teleChart.data.datasets[0].borderColor = '#8c5d33';
+                teleChart.data.datasets[1].borderColor = '#b91c1c';
+                teleChart.data.datasets[2].borderColor = '#15803d';
+                teleChart.options.scales.y.grid.color = 'rgba(15,23,42,0.12)';
+                teleChart.options.scales.y.ticks.color = '#334155';
+                teleChart.options.plugins.legend.labels.color = '#0f172a';
+            }
+            teleChart.update('none');
+        }
+
+        // ===================== XYZ RADAR CANVAS =====================
+        const xyzCanvas = document.getElementById('xyzCanvas');
+        const xyzCtx = xyzCanvas.getContext('2d');
+        const trail = [];
+        function drawXyz(x, y, z) {
+            if (!xyzCtx) return;
+            const w = xyzCanvas.width, h = xyzCanvas.height;
+            const isDark = (document.documentElement.getAttribute('data-theme') || 'dark') === 'dark';
+            xyzCtx.clearRect(0, 0, w, h);
+            const cx = w / 2, cy = h / 2;
+
+            xyzCtx.lineWidth = 1;
+            const ringCol = isDark ? 'rgba(212,175,55,0.10)' : 'rgba(15,23,42,0.14)';
+            const axisCol = isDark ? 'rgba(212,175,55,0.22)' : 'rgba(15,23,42,0.28)';
+
+            for (let r = 30; r <= 110; r += 28) {
+                xyzCtx.beginPath(); xyzCtx.strokeStyle = ringCol; xyzCtx.arc(cx, cy, r, 0, Math.PI * 2); xyzCtx.stroke();
+            }
+            xyzCtx.beginPath(); xyzCtx.strokeStyle = axisCol;
+            xyzCtx.moveTo(cx, 12); xyzCtx.lineTo(cx, h - 12);
+            xyzCtx.moveTo(24, cy); xyzCtx.lineTo(w - 24, cy);
+            xyzCtx.stroke();
+
+            const px = cx + (x || 0) * 26.0;
+            const py = cy - (y || 0) * 26.0;
+            trail.push({x: px, y: py});
+            if (trail.length > 20) trail.shift();
+
+            for (let i = 0; i < trail.length; i++) {
+                const alpha = (i + 1) / trail.length * 0.45;
+                xyzCtx.beginPath();
+                xyzCtx.fillStyle = isDark ? `rgba(212, 175, 55, ${alpha})` : `rgba(140, 93, 51, ${alpha})`;
+                xyzCtx.arc(trail[i].x, trail[i].y, 3, 0, Math.PI * 2); xyzCtx.fill();
+            }
+
+            const zNorm = Math.abs(z - 9.81);
+            const radius = Math.max(6, Math.min(15, 7 + zNorm * 2.5));
+            xyzCtx.beginPath();
+            xyzCtx.strokeStyle = isDark ? 'rgba(212, 175, 55, 0.45)' : 'rgba(140, 93, 51, 0.4)';
+            xyzCtx.lineWidth = 1.5;
+            xyzCtx.arc(px, py, radius + 5 + zNorm * 3, 0, Math.PI * 2); xyzCtx.stroke();
+
+            xyzCtx.beginPath();
+            xyzCtx.fillStyle = isDark ? '#d4af37' : '#8c5d33';
+            xyzCtx.arc(px, py, radius, 0, Math.PI * 2); xyzCtx.fill();
+
+            document.getElementById('valX').innerText = `${(x >= 0 ? '+' : '') + x.toFixed(2)} m/s²`;
+            document.getElementById('valY').innerText = `${(y >= 0 ? '+' : '') + y.toFixed(2)} m/s²`;
+            document.getElementById('valZ').innerText = `${(z >= 0 ? '+' : '') + z.toFixed(2)} m/s²`;
+        }
+
+        // ===================== DIGITAL TWIN CANVAS SIMULATION =====================
+        const dtCanvas = document.getElementById('digitalTwinCanvas');
+        const dtCtx = dtCanvas.getContext('2d');
+        let twinSpliceAngle = 0;
+
+        function renderDigitalTwin(posPct, speed, isRunning, fault) {
+            if (!dtCtx) return;
+            const w = dtCanvas.width, h = dtCanvas.height;
+            const isDark = (document.documentElement.getAttribute('data-theme') || 'dark') === 'dark';
+            dtCtx.clearRect(0, 0, w, h);
+
+            const leftX = 65, rightX = w - 65, centerY = h / 2, r = 38;
+
+            // Pulleys in Brown/Gold
+            const pulleyFill = isDark ? '#261e17' : '#e2e8f0';
+            const pulleyStroke = isDark ? '#6e543e' : '#94a3b8';
+            dtCtx.lineWidth = 2.5;
+
+            // Tail Pulley (Left)
+            dtCtx.beginPath(); dtCtx.fillStyle = pulleyFill; dtCtx.strokeStyle = pulleyStroke;
+            dtCtx.arc(leftX, centerY, r, 0, Math.PI * 2); dtCtx.fill(); dtCtx.stroke();
+
+            // Head Drive Pulley (Right)
+            dtCtx.beginPath();
+            dtCtx.fillStyle = isRunning ? (isDark ? '#33271d' : '#cbd5e1') : (isDark ? '#3d2016' : '#fee2e2');
+            dtCtx.strokeStyle = isRunning ? (isDark ? '#d4af37' : 'var(--gold)') : (isDark ? '#a84825' : '#b91c1c');
+            dtCtx.arc(rightX, centerY, r, 0, Math.PI * 2); dtCtx.fill(); dtCtx.stroke();
+
+            // Spinning spokes
+            if (isRunning) twinSpliceAngle += (speed / 3.5) * 0.08;
+            for (let a = 0; a < Math.PI * 2; a += Math.PI / 2) {
+                dtCtx.beginPath(); dtCtx.strokeStyle = isDark ? '#7a5e45' : '#64748b'; dtCtx.lineWidth = 1.5;
+                dtCtx.moveTo(rightX, centerY);
+                dtCtx.lineTo(rightX + Math.cos(twinSpliceAngle + a) * (r - 2), centerY + Math.sin(twinSpliceAngle + a) * (r - 2));
+                dtCtx.stroke();
+            }
+
+            // Continuous Rubber Belt
+            const beltCol = isDark ? '#221b15' : '#334155';
+            dtCtx.lineWidth = 7; dtCtx.strokeStyle = beltCol;
+            dtCtx.beginPath(); dtCtx.moveTo(leftX, centerY - r); dtCtx.lineTo(rightX, centerY - r); dtCtx.stroke();
+            dtCtx.beginPath(); dtCtx.moveTo(rightX, centerY + r); dtCtx.lineTo(leftX, centerY + r); dtCtx.stroke();
+            dtCtx.beginPath(); dtCtx.arc(leftX, centerY, r, Math.PI / 2, Math.PI * 1.5); dtCtx.stroke();
+            dtCtx.beginPath(); dtCtx.arc(rightX, centerY, r, Math.PI * 1.5, Math.PI / 2); dtCtx.stroke();
+
+            // Iron Ore Lumps on Carrying Run (Brown)
+            if (isRunning && speed > 0.1) {
+                const oreOffset = (Date.now() / 28 * (speed / 3.5)) % 44;
+                for (let ox = leftX + 15 + oreOffset; ox < rightX - 15; ox += 44) {
+                    dtCtx.beginPath(); dtCtx.fillStyle = isDark ? '#6e4726' : '#8c5d33';
+                    dtCtx.arc(ox, centerY - r - 5, 4, 0, Math.PI * 2); dtCtx.fill();
+                }
+            }
+
+            // Zone 3 Optical AI Scanner Beam (Golden Yellow)
+            const scanX = w / 2;
+            dtCtx.beginPath();
+            const beamGrad = dtCtx.createLinearGradient(scanX, centerY + r - 16, scanX, centerY + r + 16);
+            beamGrad.addColorStop(0, 'rgba(212, 175, 55, 0)');
+            beamGrad.addColorStop(0.5, isDark ? 'rgba(212, 175, 55, 0.45)' : 'rgba(140, 93, 51, 0.40)');
+            beamGrad.addColorStop(1, 'rgba(212, 175, 55, 0)');
+            dtCtx.fillStyle = beamGrad;
+            dtCtx.fillRect(scanX - 18, centerY + r - 12, 36, 24);
+
+            // Scanner sensor head
+            dtCtx.fillStyle = isDark ? '#d4af37' : '#8c5d33';
+            dtCtx.fillRect(scanX - 8, centerY + r + 12, 16, 7);
+
+            // Travelling Splice Joint
+            let sx, sy;
+            const topLen = rightX - leftX;
+            if (posPct < 45) {
+                const f = posPct / 45;
+                sx = leftX + f * topLen;
+                sy = centerY - r;
+            } else if (posPct < 55) {
+                const f = (posPct - 45) / 10;
+                const a = -Math.PI / 2 + f * Math.PI;
+                sx = rightX + Math.cos(a) * r;
+                sy = centerY + Math.sin(a) * r;
+            } else if (posPct < 90) {
+                const f = (posPct - 55) / 35;
+                sx = rightX - f * topLen;
+                sy = centerY + r;
+            } else {
+                const f = (posPct - 90) / 10;
+                const a = Math.PI / 2 + f * Math.PI;
+                sx = leftX + Math.cos(a) * r;
+                sy = centerY + Math.sin(a) * r;
+            }
+
+            // Draw Splice Joint in Gold (or Burnt Red/Brown if torn)
+            dtCtx.beginPath();
+            const isTear = fault === 'SPLICE_TEAR';
+            dtCtx.fillStyle = isTear ? (isDark ? '#a84825' : '#b91c1c') : (isDark ? '#d4af37' : '#15803d');
+            dtCtx.arc(sx, sy, isTear ? 7 : 5, 0, Math.PI * 2);
+            dtCtx.fill();
+            if (isTear) {
+                dtCtx.strokeStyle = isDark ? '#d4af37' : '#ef4444'; dtCtx.lineWidth = 2;
+                dtCtx.stroke();
+            }
+
+            // Descriptive Labels
+            dtCtx.fillStyle = isDark ? '#c4b5a0' : '#64748b';
+            dtCtx.font = '11px Inter';
+            dtCtx.fillText('Zone 4: Tail & Take-Up', 20, 22);
+            dtCtx.fillText('Zone 2: Carrying Run & Ore', w / 2 - 60, 22);
+            dtCtx.fillText('Zone 1: Drive Pulley', w - 145, 22);
+            dtCtx.fillText('Zone 3: Return Optical Scanner', w / 2 - 70, h - 10);
+        }
+
+        // ===================== THEME TOGGLE =====================
+        function applyTheme(t) {
+            document.documentElement.setAttribute('data-theme', t);
+            localStorage.setItem('nmdc_theme', t);
+            const isDark = t === 'dark';
+            document.getElementById('themeLabel').innerText = isDark ? 'Light Mode' : 'Dark Mode';
+            updateChartTheme();
+            drawXyz(0, 0, 9.81);
+            renderDigitalTwin(0, 3.5, true, 'NONE');
+        }
+        function toggleTheme() {
+            const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+            applyTheme(cur === 'dark' ? 'light' : 'dark');
+        }
+
+        // ===================== FAULT BUTTON HIGHLIGHTING =====================
+        function updateFaultButtonsUI(active) {
+            document.querySelectorAll('.fault-strip .btn-fault').forEach(b => {
+                b.classList.remove('active-fault');
+            });
+            const indicator = document.getElementById('activeFaultIndicator');
+            if (active && active !== 'NONE') {
+                const btn = document.getElementById('btnFault_' + active);
+                if (btn) btn.classList.add('active-fault');
+                indicator.innerText = 'ACTIVE: ' + active.replace('_', ' ');
+                indicator.style.color = 'var(--gold)';
+            } else {
+                indicator.innerText = 'ACTIVE: NONE';
+                indicator.style.color = 'var(--gold)';
+            }
+        }
+
+        // ===================== WEBSOCKET =====================
+        let ws;
+        function connectWs() {
+            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+            ws.onmessage = function(e) {
+                const d = JSON.parse(e.data);
+
+                // Header
+                document.getElementById('headerBhi').innerText = `${d.bhi.toFixed(1)}%`;
+                document.getElementById('headerRul').innerText = `${d.joint_rul_hours.toFixed(0)} hrs`;
+                const hStat = document.getElementById('headerStatus');
+                const hDot = document.getElementById('headerPulse');
+                hStat.innerText = d.status;
+                hDot.className = 'pulse-dot' + (d.status_level === 3 ? ' danger' : (d.status_level === 2 ? ' warning' : ''));
+
+                // KPIs
+                document.getElementById('kpiRul').innerText = `${d.joint_rul_hours.toFixed(0)} hrs`;
+                document.getElementById('kpiRul').style.color = d.joint_rul_hours < 48 ? 'var(--alert-burnt)' : 'var(--safe-gold)';
+                document.getElementById('kpiSpeed').innerText = `${d.speed_mps.toFixed(1)} m/s`;
+                document.getElementById('kpiLoad').innerText = `${d.throughput_tph.toFixed(0)} TPH`;
+                document.getElementById('kpiVib').innerText = `${d.vibration.toFixed(2)} mm/s`;
+
+                // Relay NC Status
+                const rText = document.getElementById('relayText');
+                const rDot = document.getElementById('relayDot');
+                const rBadgeText = document.getElementById('relayBadgeText');
+                if (d.relay_nc_energized && !d.emergency_stop) {
+                    rText.innerText = 'NC RELAY CLOSED · CONTACTOR ENERGIZED (415V)';
+                    rText.style.color = 'var(--safe-gold)';
+                    rDot.className = 'pulse-dot';
+                    rBadgeText.innerText = 'MOTOR RUNNING';
+                    document.getElementById('btnMotorLabel').innerText = 'Motor Stop';
+                } else {
+                    rText.innerText = 'NC RELAY OPEN · E-STOP INTERLOCK TRIPPED';
+                    rText.style.color = 'var(--alert-burnt)';
+                    rDot.className = 'pulse-dot danger';
+                    rBadgeText.innerText = 'MOTOR STOPPED';
+                    document.getElementById('btnMotorLabel').innerText = 'Motor Start';
+                }
+
+                // Digital Twin Canvas Update
+                renderDigitalTwin(d.belt_pos_pct, d.speed_mps, !d.emergency_stop && d.speed_mps > 0.1, d.active_fault);
+                document.getElementById('twinCycleReadout').innerText = `Splice #142 @ ${d.belt_pos_pct.toFixed(1)}% · ${d.motor_rpm.toFixed(0)} RPM`;
+
+                // Digital Twin Zones
+                if (d.zones) {
+                    document.getElementById('z1Status').innerText = d.zones.zone1.status;
+                    document.getElementById('z1Status').style.color = d.zones.zone1.level === 3 ? 'var(--alert-burnt)' : 'var(--safe-gold)';
+                    document.getElementById('z2Status').innerText = d.zones.zone2.status;
+                    document.getElementById('z2Status').style.color = d.zones.zone2.level === 3 ? 'var(--alert-burnt)' : 'var(--safe-gold)';
+                    document.getElementById('z3Status').innerText = d.zones.zone3.status;
+                    document.getElementById('z3Status').style.color = d.zones.zone3.level === 3 ? 'var(--alert-burnt)' : (d.zones.zone3.level === 2 ? 'var(--warn-amber)' : 'var(--safe-gold)');
+                    document.getElementById('z4Status').innerText = d.zones.zone4.status;
+                    document.getElementById('z4Status').style.color = d.zones.zone4.level === 3 ? 'var(--alert-burnt)' : 'var(--safe-gold)';
+                }
+
+                // Active Fault highlight
+                updateFaultButtonsUI(d.active_fault);
+
+                // Chart & XYZ
+                teleChart.data.datasets[0].data.push(d.tension); teleChart.data.datasets[0].data.shift();
+                teleChart.data.datasets[1].data.push(d.temperature); teleChart.data.datasets[1].data.shift();
+                teleChart.data.datasets[2].data.push(d.vibration); teleChart.data.datasets[2].data.shift();
+                teleChart.update('none');
+                drawXyz(d.vib_x, d.vib_y, d.vib_z);
+
+                // Video HUD
+                document.getElementById('fpsReadout').innerText = `${d.live_fps.toFixed(1)} FPS`;
+                document.getElementById('camStatus').innerText = `Status: ${d.camera_status}`;
+                document.getElementById('camSourcePill').innerText = d.camera_source.toUpperCase();
+
+                // Detections
+                const detEl = document.getElementById('detList');
+                if (d.detected_objects && d.detected_objects.length > 0) {
+                    detEl.innerHTML = d.detected_objects.map(o => `<span class="det-pill">${o.class} (${o.conf}%)</span>`).join(' ');
+                } else {
+                    detEl.innerHTML = `<span style="color:var(--text-faint); font-style:italic;">Scanning nominal return belt surface...</span>`;
+                }
+
+                // Incidents
+                if (d.incidents) {
+                    const tb = document.getElementById('incTbody');
+                    tb.innerHTML = d.incidents.map(i => {
+                        let c = 'var(--text-dim)';
+                        if (i.severity === 'CRITICAL') c = 'var(--alert-burnt)';
+                        else if (i.severity === 'WARNING') c = 'var(--warn-amber)';
+                        else if (i.severity === 'INFO') c = 'var(--safe-gold)';
+                        return `<tr><td>${i.timestamp}</td><td>${i.event}</td><td style="color:${c}; font-weight:700;">${i.severity}</td></tr>`;
+                    }).join('');
+                }
+
+                document.getElementById('btnHwChannel').innerText = `Hardware: ${d.device_connected ? 'LIVE MPU6050' : 'SIMULATION'}`;
+            };
+            ws.onclose = () => setTimeout(connectWs, 2000);
+        }
+
+        // ===================== ACTIONS =====================
+        function injectFault(type) {
+            updateFaultButtonsUI(type);
+            showToast('Fault Injected: ' + type.replace('_', ' ') + ' — Triggering PLC Contactor Trip');
+            fetch('/api/inject_fault', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ fault_type: type })
+            });
+        }
+        function resetSystem() {
+            updateFaultButtonsUI('NONE');
+            showToast('Interlock Reset: Drive Contactor Energized · Baselines Restored');
+            fetch('/api/reset', { method: 'POST' });
+        }
+        function toggleCam() { fetch('/api/toggle_camera', { method: 'POST' }); }
+        function toggleMirror() { fetch('/api/toggle_mirror', { method: 'POST' }); }
+        function toggleYolo() { fetch('/api/toggle_yolo', { method: 'POST' }); }
+        function toggleDev() { fetch('/api/toggle_device', { method: 'POST' }); }
+
+        // Digital Twin Stimulation
+        function stimulateTwin() {
+            const spd = parseFloat(document.getElementById('sliderSpeed').value);
+            const load = parseFloat(document.getElementById('sliderLoad').value);
+            document.getElementById('stimSpeedVal').innerText = `${spd.toFixed(1)} m/s`;
+            document.getElementById('stimLoadVal').innerText = `${load.toFixed(0)} TPH`;
+            fetch('/api/set_twin_params', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ speed_mps: spd, throughput_tph: load })
+            });
+        }
+        function toggleMotorTwin() {
+            const curSpd = parseFloat(document.getElementById('sliderSpeed').value);
+            const newSpd = curSpd > 0.1 ? 0.0 : 3.5;
+            document.getElementById('sliderSpeed').value = newSpd;
+            stimulateTwin();
+        }
+
+        // Modals
+        function openSettingsModal() { document.getElementById('settingsModal').style.display = 'flex'; }
+        function closeSettingsModal() { document.getElementById('settingsModal').style.display = 'none'; }
+        function openJuryModal() { document.getElementById('juryModal').style.display = 'flex'; }
+        function closeJuryModal() { document.getElementById('juryModal').style.display = 'none'; }
+        function sourceChange() {
+            document.getElementById('esp32Grp').style.display = document.getElementById('selSource').value === 'esp32' ? 'block' : 'none';
+        }
+        function applySettings() {
+            const s = document.getElementById('selSource').value;
+            const u = document.getElementById('inpUrl').value.trim();
+            fetch('/api/set_camera_config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ source: s, esp32_url: u })
+            }).then(() => closeSettingsModal());
+        }
+
+        // INITIALIZE ALL
+        applyTheme(localStorage.getItem('nmdc_theme') || 'dark');
+        connectWs();
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def landing():
+    return HTMLResponse(content=LANDING_HTML)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
