@@ -12,3 +12,5 @@ runs/
 *.cache
 
 server.zip
+cloudflared.exe
+*.exe
