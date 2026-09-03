@@ -9,20 +9,24 @@ import sys
 import time
 import re
 import subprocess
-import signal
+
+# Ensure UTF-8 output on Windows consoles
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(base_dir)
 
     print("=" * 72)
-    print("  TEAM AYASK · NMDC CONVEYOR AI SCADA PUBLIC LAUNCHER")
+    print("  TEAM AYASK - NMDC CONVEYOR AI SCADA PUBLIC LAUNCHER")
     print("=" * 72)
 
-    # 1. Start FastAPI / Uvicorn Server
+    # 1. Start FastAPI / Uvicorn Server with log capture and auto-restart
     print("\n[1/3] Launching local SCADA application server on port 8000...")
+    server_log = open("server_output.log", "w", encoding="utf-8")
     server_cmd = [sys.executable, "-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "8000"]
-    server_proc = subprocess.Popen(server_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=server_log)
     time.sleep(2.5)
 
     # 2. Check Cloudflared Binary
@@ -32,7 +36,7 @@ def main():
         import urllib.request
         cf_url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
         urllib.request.urlretrieve(cf_url, cloudflared_path)
-        print("[✓] Download complete.")
+        print("[OK] Download complete.")
 
     # 3. Launch Cloudflare Tunnel
     print("[2/3] Establishing secure global HTTPS tunnel...")
@@ -59,19 +63,19 @@ def main():
 
     if not public_url:
         print("[!] Warning: Could not automatically parse tunnel URL. Checking tunnel logs...")
-        public_url = "https://trycloudflare.com (Check console)"
+        public_url = "https://trycloudflare.com"
 
     # 4. Display Credentials and Access Information
     print("\n" + "=" * 72)
     print("  [SUCCESS] PUBLIC ACCESS LINK GENERATED SUCCESSFULLY!")
     print("=" * 72)
     print(f"\n  PUBLIC LINK (Share this with anyone):")
-    print(f"  >>> {public_url} <<<")
+    print(f"  --> {public_url} <--")
     print(f"\n  LOCAL DASHBOARD:")
-    print(f"  >>> http://127.0.0.1:8000/dashboard <<<")
+    print(f"  --> http://127.0.0.1:8000/dashboard <--")
     print(f"\n  DEMO OPERATOR CREDENTIALS:")
-    print(f"  • Email:    operator@nmdc.gov.in")
-    print(f"  • Password: Admin@1234")
+    print(f"  * Email:    operator@nmdc.gov.in")
+    print(f"  * Password: Admin@1234")
     print("\n" + "=" * 72)
     print("  Keep this window OPEN to keep the public link active.")
     print("  Press Ctrl+C to terminate the public link.")
@@ -79,26 +83,32 @@ def main():
 
     # Save current public link to a text file for convenience
     with open("PUBLIC_ACCESS_LINK.txt", "w", encoding="utf-8") as f:
-        f.write(f"TEAM AYASK · NMDC SCADA PUBLIC LINK:\n{public_url}\n\nLogin: operator@nmdc.gov.in\nPassword: Admin@1234\n")
+        f.write(f"TEAM AYASK - NMDC SCADA PUBLIC LINK:\n{public_url}\n\nLogin: operator@nmdc.gov.in\nPassword: Admin@1234\n")
 
-    # Keep alive
+    # Keep alive with auto-healing
     try:
         while True:
-            time.sleep(1)
+            time.sleep(2)
             if server_proc.poll() is not None:
-                print("[!] Server process terminated unexpectedly.")
-                break
+                print("[!] Re-spawning server process...")
+                server_log.close()
+                server_log = open("server_output.log", "a", encoding="utf-8")
+                server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=server_log)
             if tunnel_proc.poll() is not None:
-                print("[!] Tunnel process terminated unexpectedly.")
+                print("[!] Tunnel closed.")
                 break
     except KeyboardInterrupt:
         print("\n[*] Shutting down public SCADA tunnel and local server...")
     finally:
         tunnel_proc.terminate()
         server_proc.terminate()
-        tunnel_proc.wait(timeout=3)
-        server_proc.wait(timeout=3)
-        print("[✓] Clean shutdown complete.")
+        try:
+            tunnel_proc.wait(timeout=3)
+            server_proc.wait(timeout=3)
+        except Exception:
+            pass
+        server_log.close()
+        print("[OK] Clean shutdown complete.")
 
 if __name__ == "__main__":
     main()
