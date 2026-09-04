@@ -10,6 +10,8 @@ import plotly.graph_objects as go
 from ultralytics import YOLO
 from src.fusion_engine import FusionEngine
 import platform
+import os
+import tempfile
 
 st.set_page_config(page_title="NMDC Conveyor Health AI", layout="wide")
 
@@ -55,7 +57,6 @@ def init_camera(camera_index=0):
     
     # Verify camera opened successfully
     if not cap.isOpened():
-        st.error(f"⚠️ Camera {camera_index} failed to open. Trying alternative devices...")
         return None
     
     # Test if camera can grab a frame
@@ -72,10 +73,8 @@ def find_working_camera():
     for i in range(5):  # Try camera indices 0-4
         cap = init_camera(i)
         if cap is not None:
-            st.success(f"✅ Camera {i} initialized successfully")
             return cap
     
-    st.error("❌ No camera device found. Using simulated feed.")
     return None
 
 vision_model, telemetry_model = load_models()
@@ -97,14 +96,89 @@ with col_left:
     video_placeholder = st.empty()
     camera_status = st.empty()
 
-# Simulation Loop
-if st.button("▶️ Start Monitoring Simulation"):
-    # Load simulated sensor log
-    telemetry_df = pd.read_csv("data/conveyor_telemetry.csv")
+# Input Mode Selection
+st.divider()
+st.subheader("🎥 Video Input Options")
+
+input_mode = st.radio(
+    "Select video source:",
+    options=["📁 Upload Video File", "🎬 Use Sample Video", "📷 Use Webcam"],
+    horizontal=True
+)
+
+video_file = None
+video_path = None
+
+if input_mode == "📁 Upload Video File":
+    st.info("💡 Upload a conveyor belt video (MP4, AVI, MOV) for analysis")
+    uploaded_file = st.file_uploader("📤 Upload a video file", type=["mp4", "avi", "mov", "mkv"])
     
-    # Find and initialize camera with fallback
-    cap = find_working_camera()
-    camera_available = cap is not None
+    if uploaded_file is not None:
+        # Save uploaded file to temporary location
+        temp_dir = tempfile.gettempdir()
+        video_path = os.path.join(temp_dir, "uploaded_video.mp4")
+        
+        with open(video_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        st.success(f"✅ Video uploaded successfully: {uploaded_file.name}")
+        video_file = video_path
+
+elif input_mode == "🎬 Use Sample Video":
+    st.info("💡 Using the default sample conveyor belt video")
+    # Check if sample video exists
+    if os.path.exists("data/videos/conveyor_sample.mp4"):
+        video_path = "data/videos/conveyor_sample.mp4"
+        st.success("✅ Sample video found and ready to use")
+        video_file = video_path
+    else:
+        st.warning("⚠️ Sample video not found at 'data/videos/conveyor_sample.mp4'")
+        st.info("Please upload a video file instead")
+
+elif input_mode == "📷 Use Webcam":
+    st.info("💡 Using local webcam (only works when running locally, not on Vercel)")
+    if os.environ.get("VERCEL"):
+        st.error("❌ Webcam access is not available on Vercel (serverless platform). Please use uploaded video or sample video instead.")
+    else:
+        st.success("✅ Webcam mode enabled")
+
+# Simulation Loop
+if st.button("▶️ Start Monitoring Simulation", type="primary"):
+    # Load simulated sensor log
+    try:
+        telemetry_df = pd.read_csv("data/conveyor_telemetry.csv")
+    except FileNotFoundError:
+        st.error("❌ Telemetry data file not found: data/conveyor_telemetry.csv")
+        st.stop()
+    
+    cap = None
+    camera_available = False
+    
+    # Initialize video source based on input mode
+    if input_mode == "📷 Use Webcam":
+        if not os.environ.get("VERCEL"):
+            cap = find_working_camera()
+            camera_available = cap is not None
+            if camera_available:
+                camera_status.success("✅ Live camera feed active")
+            else:
+                camera_status.warning("⚠️ Using simulated feed - camera not available")
+        else:
+            camera_status.error("❌ Webcam not available on Vercel - use uploaded video instead")
+    else:
+        # Use video file
+        if video_file:
+            if os.path.exists(video_file):
+                cap = cv2.VideoCapture(video_file)
+                if cap.isOpened():
+                    camera_available = True
+                    camera_status.success(f"✅ Video file loaded: {os.path.basename(video_file)}")
+                else:
+                    camera_status.error("❌ Failed to open video file")
+            else:
+                camera_status.error("❌ Video file not found")
+        else:
+            camera_status.warning("⚠️ No video file selected - using simulated feed")
     
     # Check GPU device
     device_id = 0 if torch.cuda.is_available() else "cpu"
@@ -115,7 +189,7 @@ if st.button("▶️ Start Monitoring Simulation"):
         for idx, row in telemetry_df.iloc[::20].iterrows():
             frame = None
             
-            if camera_available:
+            if camera_available and cap is not None:
                 ret = False
                 # Try multiple attempts to grab frame
                 for attempt in range(3):
@@ -124,19 +198,20 @@ if st.button("▶️ Start Monitoring Simulation"):
                         break
                     time.sleep(0.05)
                 
+                # If video ends, loop back to start
                 if not ret or frame is None:
-                    frame = None
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                    if not ret:
+                        frame = None
             
             # Fallback to simulated frame if camera fails
             if frame is None:
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(frame, "SIMULATED CONVEYOR FEED", (80, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
-                cv2.putText(frame, "(Camera Unavailable)", (150, 300),
+                cv2.putText(frame, "(No Video Source Available)", (120, 300),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 1)
-                camera_status.warning("⚠️ Using simulated feed - camera not available")
-            else:
-                camera_status.success("✅ Live camera feed active")
             
             # Resize frame for consistency
             frame = cv2.resize(frame, (640, 480))
@@ -213,8 +288,29 @@ if st.button("▶️ Start Monitoring Simulation"):
     
     except Exception as e:
         st.error(f"❌ Error during monitoring: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
     
     finally:
         if cap is not None:
             cap.release()
-        st.info(f"✅ Monitoring complete. Processed {frame_count} frames.")
+        st.success(f"✅ Monitoring complete. Processed {frame_count} frames.")
+
+# Sidebar information
+with st.sidebar:
+    st.subheader("ℹ️ System Information")
+    st.write(f"**Platform:** {platform.system()}")
+    st.write(f"**Python Version:** {platform.python_version()}")
+    st.write(f"**GPU Available:** {'Yes (CUDA)' if torch.cuda.is_available() else 'No (CPU Mode)'}")
+    st.write(f"**Deployment:** {'Vercel (Cloud)' if os.environ.get('VERCEL') else 'Local'}")
+    
+    st.divider()
+    st.subheader("📋 Instructions")
+    st.markdown("""
+    1. **Select Video Source**: Choose between upload, sample, or webcam
+    2. **Upload or Select**: Provide your video file
+    3. **Start Monitoring**: Click the button to begin analysis
+    4. **View Results**: Monitor belt health in real-time
+    
+    **Note:** Webcam only works locally. Use video files on Vercel.
+    """)
