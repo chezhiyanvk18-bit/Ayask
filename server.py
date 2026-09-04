@@ -2220,4 +2220,15 @@ def dashboard():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # In cloud environments (Render, Railway, Heroku), bind to 0.0.0.0
+    # Locally on Windows, bind to 127.0.0.1 so Uvicorn shows clickable http://127.0.0.1:8000 (0.0.0.0 throws ERR_ADDRESS_INVALID in Windows Chrome)
+    is_cloud = "PORT" in os.environ
+    host = "0.0.0.0" if is_cloud else "127.0.0.1"
+
+    print("\n" + "=" * 68)
+    print("  AYASK SCADA Server Started Successfully!")
+    print(f"  Open in your browser: http://localhost:{port} or http://127.0.0.1:{port}")
+    print("  (Note: Do NOT type 0.0.0.0 in Windows Chrome)")
+    print("=" * 68 + "\n")
+
+    uvicorn.run(app, host=host, port=port)
