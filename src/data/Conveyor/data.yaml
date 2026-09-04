@@ -1,13 +1,18 @@
-train: ../train/images
-val: ../valid/images
-test: ../test/images
-
+names:
+- Clips
+- Damage
+- Loops
+- Repair
+- Splice
+- Splice Number
 nc: 6
-names: ['Clips', 'Damage', 'Loops', 'Repair', 'Splice', 'Splice Number']
-
+path: C:\Project H1\src\data\Conveyor
 roboflow:
-  workspace: fyp-lnegm
-  project: conveyor-belt-x0o7y
-  version: 15
   license: CC BY 4.0
+  project: conveyor-belt-x0o7y
   url: https://universe.roboflow.com/fyp-lnegm/conveyor-belt-x0o7y/dataset/15
+  version: 15
+  workspace: fyp-lnegm
+test: test/images
+train: train/images
+val: valid/images
