@@ -16,3 +16,4 @@ cloudflared.exe
 *.exe
 server_output.log
 PUBLIC_ACCESS_LINK.txt
+config.yml
