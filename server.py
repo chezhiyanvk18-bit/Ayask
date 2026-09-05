@@ -119,11 +119,11 @@ def signup(req: SignupRequest):
     password = req.password
 
     if len(name) < 2:
-        raise HTTPException(status_code=400, detail="Please enter your full name.")
+        raise HTTPException(status_code=400, detail="Please enter a valid name.")
     if not EMAIL_RE.match(email):
         raise HTTPException(status_code=400, detail="Please enter a valid email address.")
     if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+        raise HTTPException(status_code=400, detail="PPassword must be at least 8 characters.")
     if email in users_db:
         raise HTTPException(status_code=409, detail="An account with this email already exists. Please sign in instead.")
 
@@ -208,6 +208,17 @@ class SystemState:
         self.vibration_x = 0.42
         self.vibration_y = -0.28
         self.vibration_z = 9.81
+        
+        # Multi-Point Idler Bearing Thermal Monitoring (DS18B20 1-Wire Array)
+        self.idler1_temp_c = 42.3  # IDLER 01 (Head Transition)
+        self.idler2_temp_c = 51.7  # IDLER 02 (Impact Trough)
+        self.idler3_temp_c = 46.8  # IDLER 03 (Carrying Run)
+        self.idler4_temp_c = 39.4  # IDLER 04 (Return Pulley)
+        
+        # Dual HX711 Load Cell Array (24-bit Strain Gauge Bridge)
+        self.loadcell_1_kn = 22.6  # LC-01 Take-Up Left (kN)
+        self.loadcell_2_kn = 22.4  # LC-02 Take-Up Right (kN)
+        self.loadcell_raw_adc = 8412030  # Raw HX711 24-bit ADC counts
         
         # Conveyor Alignment & Material Surface
         self.misalignment_mm = 2.1
@@ -561,6 +572,42 @@ def update_telemetry_step():
     state.vibration_y = round(base_y, 2)
     state.vibration_z = round(base_z, 2)
 
+    # Dynamic Idler Temperatures & Dual Load Cell Updates
+    if state.active_fault == "BEARING_HOTSPOT":
+        state.idler2_temp_c = round(min(96.8, state.idler2_temp_c + 1.2), 1)
+        state.idler1_temp_c = round(min(74.5, state.idler1_temp_c + 0.3), 1)
+        state.idler3_temp_c = round(min(62.0, state.idler3_temp_c + 0.2), 1)
+        state.idler4_temp_c = round(min(45.0, state.idler4_temp_c + 0.1), 1)
+        state.bearing_temp_c = state.idler2_temp_c
+        state.loadcell_1_kn = round(state.tension_kn * 0.502 + random.uniform(-0.05, 0.05), 1)
+        state.loadcell_2_kn = round(state.tension_kn * 0.498 + random.uniform(-0.05, 0.05), 1)
+        state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-200, 200))
+    elif state.active_fault == "TENSION_SURGE":
+        state.loadcell_1_kn = round(state.tension_kn * 0.508 + random.uniform(-0.08, 0.08), 1)
+        state.loadcell_2_kn = round(state.tension_kn * 0.492 + random.uniform(-0.08, 0.08), 1)
+        state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-300, 300))
+        state.idler1_temp_c = round(42.3 + random.uniform(-0.1, 0.1), 1)
+        state.idler2_temp_c = round(51.7 + random.uniform(-0.1, 0.1), 1)
+        state.idler3_temp_c = round(46.8 + random.uniform(-0.1, 0.1), 1)
+        state.idler4_temp_c = round(39.4 + random.uniform(-0.1, 0.1), 1)
+    elif state.active_fault == "SPLICE_TEAR":
+        state.loadcell_1_kn = round(max(5.0, state.tension_kn * 0.50 + random.uniform(-0.05, 0.05)), 1)
+        state.loadcell_2_kn = round(max(5.0, state.tension_kn * 0.50 + random.uniform(-0.05, 0.05)), 1)
+        state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-200, 200))
+        state.idler1_temp_c = round(42.3 + random.uniform(-0.15, 0.15), 1)
+        state.idler2_temp_c = round(51.7 + random.uniform(-0.15, 0.15), 1)
+        state.idler3_temp_c = round(46.8 + random.uniform(-0.15, 0.15), 1)
+        state.idler4_temp_c = round(39.4 + random.uniform(-0.15, 0.15), 1)
+    else:
+        state.idler1_temp_c = round(42.3 + random.uniform(-0.15, 0.15), 1)
+        state.idler2_temp_c = round(51.7 + random.uniform(-0.20, 0.20), 1)
+        state.idler3_temp_c = round(46.8 + random.uniform(-0.12, 0.12), 1)
+        state.idler4_temp_c = round(39.4 + random.uniform(-0.10, 0.10), 1)
+        state.bearing_temp_c = max(state.idler1_temp_c, state.idler2_temp_c, state.idler3_temp_c, state.idler4_temp_c)
+        state.loadcell_1_kn = round(state.tension_kn * 0.502 + random.uniform(-0.06, 0.06), 1)
+        state.loadcell_2_kn = round(state.tension_kn * 0.498 + random.uniform(-0.06, 0.06), 1)
+        state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-250, 250))
+
     pen_tension = abs(state.tension_kn - 45.0) * 1.6
     pen_temp = max(0.0, state.bearing_temp_c - 60.0) * 1.8
     pen_vib = max(0.0, state.vibration_rms - 2.8) * 7.0
@@ -675,6 +722,13 @@ def reset_system():
     state.relay_nc_energized = True
     state.tension_kn = 45.0
     state.bearing_temp_c = 52.4
+    state.idler1_temp_c = 42.3
+    state.idler2_temp_c = 51.7
+    state.idler3_temp_c = 46.8
+    state.idler4_temp_c = 39.4
+    state.loadcell_1_kn = 22.6
+    state.loadcell_2_kn = 22.4
+    state.loadcell_raw_adc = 8412030
     state.vibration_rms = 2.10
     state.vibration_x = 0.42
     state.vibration_y = -0.28
@@ -783,6 +837,21 @@ async def websocket_telemetry(websocket: WebSocket):
                 "motor_rpm": round(state.motor_rpm, 0),
                 "tension": round(state.tension_kn, 1),
                 "temperature": round(state.bearing_temp_c, 1),
+                "idlers": [
+                    {"id": "IDLER 01", "name": "Head Transition", "temp": state.idler1_temp_c, "status": "NOMINAL" if state.idler1_temp_c < 75.0 else "OVERHEAT"},
+                    {"id": "IDLER 02", "name": "Impact Trough", "temp": state.idler2_temp_c, "status": "NOMINAL" if state.idler2_temp_c < 80.0 else "OVERHEAT"},
+                    {"id": "IDLER 03", "name": "Carrying Run", "temp": state.idler3_temp_c, "status": "NOMINAL" if state.idler3_temp_c < 75.0 else "OVERHEAT"},
+                    {"id": "IDLER 04", "name": "Return Pulley", "temp": state.idler4_temp_c, "status": "NOMINAL" if state.idler4_temp_c < 70.0 else "OVERHEAT"}
+                ],
+                "load_cells": {
+                    "lc1_kn": state.loadcell_1_kn,
+                    "lc2_kn": state.loadcell_2_kn,
+                    "total_kn": round(state.tension_kn, 1),
+                    "raw_adc": state.loadcell_raw_adc,
+                    "lc1_kg": int(state.loadcell_1_kn * 101.97),
+                    "lc2_kg": int(state.loadcell_2_kn * 101.97),
+                    "total_kg": int(state.tension_kn * 101.97)
+                },
                 "vibration": round(state.vibration_rms, 2),
                 "vib_x": state.vibration_x,
                 "vib_y": state.vibration_y,
@@ -1502,21 +1571,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="z-num">Zone 1 · Head</div>
                             <div class="z-title">Drive Motor (415V)</div>
                             <div class="z-status" id="z1Status">NOMINAL</div>
+                            <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--gold); margin-top:5px;" id="twinIdler1">IDLER 01: 42.3°C</div>
                         </div>
                         <div class="zone-card" id="cardZone2">
                             <div class="z-num">Zone 2 · Carrying</div>
                             <div class="z-title">Troughing Run & Ore</div>
                             <div class="z-status" id="z2Status">NOMINAL</div>
+                            <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--gold); margin-top:5px;" id="twinIdler2">IDLER 02: 51.7°C · 03: 46.8°C</div>
                         </div>
                         <div class="zone-card" id="cardZone3">
                             <div class="z-num">Zone 3 · Return</div>
                             <div class="z-title">Optical AI & MPU6050</div>
                             <div class="z-status" id="z3Status">NOMINAL</div>
+                            <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--gold); margin-top:5px;" id="twinIdler4">IDLER 04: 39.4°C</div>
                         </div>
                         <div class="zone-card" id="cardZone4">
                             <div class="z-num">Zone 4 · Tail</div>
-                            <div class="z-title">Take-Up & HX711</div>
+                            <div class="z-title">Take-Up & Dual HX711</div>
                             <div class="z-status" id="z4Status">NOMINAL</div>
+                            <div style="font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--gold); margin-top:5px;" id="twinLoadCell">Load Cells: 45.0 kN</div>
                         </div>
                     </div>
                 </div>
@@ -1650,6 +1723,94 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <span>Reset System & Restore Motor Contactor</span>
                         </button>
                     </div>
+                </div>
+            </div>
+
+            <!-- Multi-Point Idler Bearing Temperatures (DS18B20 Array) & Dual Load Cell (HX711) -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <svg class="scada-icon" viewBox="0 0 24 24"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
+                        <span>Multi-Point Idler Temperatures & Dual HX711 Load Cell Array</span>
+                    </div>
+                    <span style="font-size:12px; color:var(--text-dim);">DS18B20 1-Wire Array &bull; 24-Bit Strain Gauge Bridge</span>
+                </div>
+                <div class="card-body" style="display:flex; flex-direction:column; gap:20px;">
+                    
+                    <!-- IDLER TEMPERATURES (4 MONITORED NODES) -->
+                    <div>
+                        <div style="font-size:11.5px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+                            <span>Bearing Temperature Monitoring (4 Idler Nodes)</span>
+                            <span style="font-size:11px; color:var(--gold); font-family:'JetBrains Mono',monospace;">ALARM LIMIT: &gt;80.0°C · TRIP: &gt;85.0°C</span>
+                        </div>
+                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:12px;">
+                            <div class="idler-box" id="boxIdler1" style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px; text-align:left; transition:all 0.2s ease;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">IDLER 01</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:4px;">Head Transition</div>
+                                <div style="font-size:11.5px; color:var(--text-dim);">Temperature:</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valIdler1">42.3°C</div>
+                                <div style="font-size:10px; font-weight:700; color:var(--safe-gold); margin-top:4px;" id="statIdler1">NOMINAL</div>
+                            </div>
+
+                            <div class="idler-box" id="boxIdler2" style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px; text-align:left; transition:all 0.2s ease;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">IDLER 02</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:4px;">Impact Trough</div>
+                                <div style="font-size:11.5px; color:var(--text-dim);">Temperature:</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valIdler2">51.7°C</div>
+                                <div style="font-size:10px; font-weight:700; color:var(--safe-gold); margin-top:4px;" id="statIdler2">NOMINAL</div>
+                            </div>
+
+                            <div class="idler-box" id="boxIdler3" style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px; text-align:left; transition:all 0.2s ease;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">IDLER 03</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:4px;">Carrying Run</div>
+                                <div style="font-size:11.5px; color:var(--text-dim);">Temperature:</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valIdler3">46.8°C</div>
+                                <div style="font-size:10px; font-weight:700; color:var(--safe-gold); margin-top:4px;" id="statIdler3">NOMINAL</div>
+                            </div>
+
+                            <div class="idler-box" id="boxIdler4" style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px; text-align:left; transition:all 0.2s ease;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">IDLER 04</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:4px;">Return Pulley</div>
+                                <div style="font-size:11.5px; color:var(--text-dim);">Temperature:</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valIdler4">39.4°C</div>
+                                <div style="font-size:10px; font-weight:700; color:var(--safe-gold); margin-top:4px;" id="statIdler4">NOMINAL</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- DUAL LOAD CELL (HX711) -->
+                    <div>
+                        <div style="font-size:11.5px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+                            <span>Gravity Take-Up Dual Load Cell Telemetry (HX711 Array)</span>
+                            <span style="font-size:11px; color:var(--gold); font-family:'JetBrains Mono',monospace;">SAFE RANGE: 25.0 – 65.0 kN</span>
+                        </div>
+                        <div style="display:grid; grid-template-columns: 1fr 1fr 1.3fr; gap:12px;">
+                            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">LOAD CELL LC-01</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:6px;">Left Take-Up Sheave</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valLc1">22.6 kN</div>
+                                <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;" id="subLc1">2,304 kg (50.2% balance)</div>
+                            </div>
+
+                            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px;">
+                                <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">LOAD CELL LC-02</div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:6px;">Right Take-Up Sheave</div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--gold);" id="valLc2">22.4 kN</div>
+                                <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;" id="subLc2">2,284 kg (49.8% balance)</div>
+                            </div>
+
+                            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:14px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                    <div style="font-size:11px; font-weight:700; color:var(--text-dim); letter-spacing:0.5px;">TOTAL COMBINED TENSION</div>
+                                    <span class="chip" id="chipTensionStatus" style="padding:2px 8px; font-size:10px; font-weight:700;">BALANCED</span>
+                                </div>
+                                <div style="font-size:10.5px; color:var(--text-faint); margin-bottom:6px;">HX711 24-Bit ADC: <span id="valAdcCounts" style="font-family:'JetBrains Mono',monospace; color:var(--gold);">8,412,030</span></div>
+                                <div style="font-size:22px; font-weight:800; font-family:'JetBrains Mono',monospace; color:var(--safe-gold);" id="valTotalTension">45.0 kN</div>
+                                <div style="font-size:11.5px; color:var(--text-dim); margin-top:4px;" id="subTotalTension">4,588 kg dynamic tension load</div>
+                            </div>
+                        </div>
+                    </div>
+
                 </div>
             </div>
 
@@ -2106,6 +2267,74 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 // Active Fault highlight
                 updateFaultButtonsUI(d.active_fault);
+
+                // Multi-Point Idler Temperatures Update
+                if (d.idlers && d.idlers.length >= 4) {
+                    for (let i = 0; i < 4; i++) {
+                        const idl = d.idlers[i];
+                        const idx = i + 1;
+                        const valEl = document.getElementById('valIdler' + idx);
+                        const statEl = document.getElementById('statIdler' + idx);
+                        const boxEl = document.getElementById('boxIdler' + idx);
+                        if (valEl) valEl.innerText = `${idl.temp.toFixed(1)}°C`;
+                        if (statEl) {
+                            statEl.innerText = idl.status;
+                            statEl.style.color = idl.status === 'OVERHEAT' ? 'var(--alert-burnt)' : 'var(--safe-gold)';
+                        }
+                        if (boxEl) {
+                            boxEl.style.borderColor = idl.status === 'OVERHEAT' ? 'var(--alert-burnt)' : 'var(--border)';
+                            boxEl.style.background = idl.status === 'OVERHEAT' ? 'var(--alert-burnt-bg)' : 'var(--bg-input)';
+                        }
+                    }
+                    const tIdl1 = document.getElementById('twinIdler1');
+                    if (tIdl1) tIdl1.innerText = `IDLER 01: ${d.idlers[0].temp.toFixed(1)}°C`;
+                    const tIdl2 = document.getElementById('twinIdler2');
+                    if (tIdl2) tIdl2.innerText = `IDLER 02: ${d.idlers[1].temp.toFixed(1)}°C · 03: ${d.idlers[2].temp.toFixed(1)}°C`;
+                    const tIdl4 = document.getElementById('twinIdler4');
+                    if (tIdl4) tIdl4.innerText = `IDLER 04: ${d.idlers[3].temp.toFixed(1)}°C`;
+                }
+
+                // Dual Load Cell (HX711) Telemetry Update
+                if (d.load_cells) {
+                    const lc = d.load_cells;
+                    const elLc1 = document.getElementById('valLc1');
+                    const elLc2 = document.getElementById('valLc2');
+                    const elTot = document.getElementById('valTotalTension');
+                    const elSub1 = document.getElementById('subLc1');
+                    const elSub2 = document.getElementById('subLc2');
+                    const elSubTot = document.getElementById('subTotalTension');
+                    const elAdc = document.getElementById('valAdcCounts');
+                    const chipTension = document.getElementById('chipTensionStatus');
+                    const twinLc = document.getElementById('twinLoadCell');
+
+                    if (elLc1) elLc1.innerText = `${lc.lc1_kn.toFixed(1)} kN`;
+                    if (elLc2) elLc2.innerText = `${lc.lc2_kn.toFixed(1)} kN`;
+                    if (elTot) {
+                        elTot.innerText = `${lc.total_kn.toFixed(1)} kN`;
+                        elTot.style.color = lc.total_kn > 65.0 ? 'var(--alert-burnt)' : (lc.total_kn < 20.0 ? 'var(--warn-amber)' : 'var(--safe-gold)');
+                    }
+                    if (elSub1) elSub1.innerText = `${lc.lc1_kg.toLocaleString()} kg (${((lc.lc1_kn/lc.total_kn)*100 || 50).toFixed(1)}% balance)`;
+                    if (elSub2) elSub2.innerText = `${lc.lc2_kg.toLocaleString()} kg (${((lc.lc2_kn/lc.total_kn)*100 || 50).toFixed(1)}% balance)`;
+                    if (elSubTot) elSubTot.innerText = `${lc.total_kg.toLocaleString()} kg dynamic tension load`;
+                    if (elAdc) elAdc.innerText = lc.raw_adc.toLocaleString();
+                    if (twinLc) twinLc.innerText = `Load Cells: ${lc.total_kn.toFixed(1)} kN (${lc.lc1_kn.toFixed(1)} + ${lc.lc2_kn.toFixed(1)})`;
+
+                    if (chipTension) {
+                        if (lc.total_kn > 65.0) {
+                            chipTension.innerText = 'OVERLOAD';
+                            chipTension.style.color = 'var(--alert-burnt)';
+                            chipTension.style.borderColor = 'var(--alert-burnt)';
+                        } else if (lc.total_kn < 20.0) {
+                            chipTension.innerText = 'SLACK / TEAR';
+                            chipTension.style.color = 'var(--warn-amber)';
+                            chipTension.style.borderColor = 'var(--warn-amber)';
+                        } else {
+                            chipTension.innerText = 'BALANCED';
+                            chipTension.style.color = 'var(--safe-gold)';
+                            chipTension.style.borderColor = 'var(--border)';
+                        }
+                    }
+                }
 
                 // Chart & XYZ
                 teleChart.data.datasets[0].data.push(d.tension); teleChart.data.datasets[0].data.shift();
