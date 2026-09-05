@@ -24,6 +24,13 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
+import threading
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 # Initialize FastAPI App
 app = FastAPI(title="Team AYASK - NMDC Belt Monitoring SCADA")
@@ -219,6 +226,15 @@ class SystemState:
         self.loadcell_1_kn = 22.6  # LC-01 Take-Up Left (kN)
         self.loadcell_2_kn = 22.4  # LC-02 Take-Up Right (kN)
         self.loadcell_raw_adc = 8412030  # Raw HX711 24-bit ADC counts
+        self.loadcell_weight_kg = 2.45   # Physical weight on 10kg bench load cell
+        
+        # Physical IoT Hardware Bridge (MPU6050, DS18B20, HX711)
+        self.hardware_source = "SIMULATED DIGITAL TWIN"
+        self.hardware_port = "NONE"
+        self.hardware_baud = 115200
+        self.hardware_last_rx = 0.0
+        self.hardware_packet_count = 0
+        self.raw_serial_buffer = []
         
         # Conveyor Alignment & Material Surface
         self.misalignment_mm = 2.1
@@ -554,10 +570,14 @@ def update_telemetry_step():
         state.zones["zone2"]["level"] = 1
 
     else:
-        state.tension_kn += random.uniform(-0.25, 0.25)
-        state.bearing_temp_c += random.uniform(-0.12, 0.12)
-        state.misalignment_mm += random.uniform(-0.18, 0.18)
-        state.vibration_rms += random.uniform(-0.06, 0.06)
+        # If real physical hardware is connected and active within last 2.5s, preserve real readings!
+        if state.device_connected and (time.time() - state.hardware_last_rx < 2.5):
+            pass # Keep exact live physical sensor data from MPU6050, DS18B20 & HX711
+        else:
+            state.tension_kn += random.uniform(-0.25, 0.25)
+            state.bearing_temp_c += random.uniform(-0.12, 0.12)
+            state.misalignment_mm += random.uniform(-0.18, 0.18)
+            state.vibration_rms += random.uniform(-0.06, 0.06)
         state.speed_mps = 3.5
         state.throughput_tph = 1250.0
         state.joint_rul_hours = 720.0
@@ -565,12 +585,13 @@ def update_telemetry_step():
             state.zones[zkey]["status"] = "NOMINAL"
             state.zones[zkey]["level"] = 1
 
-    state.tension_kn = max(0.0, min(85.0, state.tension_kn))
-    state.bearing_temp_c = max(20.0, min(120.0, state.bearing_temp_c))
-    state.vibration_rms = max(0.5, min(16.0, state.vibration_rms))
-    state.vibration_x = round(base_x, 2)
-    state.vibration_y = round(base_y, 2)
-    state.vibration_z = round(base_z, 2)
+    if not (state.device_connected and (time.time() - state.hardware_last_rx < 2.5)):
+        state.tension_kn = max(0.0, min(85.0, state.tension_kn))
+        state.bearing_temp_c = max(20.0, min(120.0, state.bearing_temp_c))
+        state.vibration_rms = max(0.5, min(16.0, state.vibration_rms))
+        state.vibration_x = round(base_x, 2)
+        state.vibration_y = round(base_y, 2)
+        state.vibration_z = round(base_z, 2)
 
     # Dynamic Idler Temperatures & Dual Load Cell Updates
     if state.active_fault == "BEARING_HOTSPOT":
@@ -599,14 +620,17 @@ def update_telemetry_step():
         state.idler3_temp_c = round(46.8 + random.uniform(-0.15, 0.15), 1)
         state.idler4_temp_c = round(39.4 + random.uniform(-0.15, 0.15), 1)
     else:
-        state.idler1_temp_c = round(42.3 + random.uniform(-0.15, 0.15), 1)
-        state.idler2_temp_c = round(51.7 + random.uniform(-0.20, 0.20), 1)
-        state.idler3_temp_c = round(46.8 + random.uniform(-0.12, 0.12), 1)
-        state.idler4_temp_c = round(39.4 + random.uniform(-0.10, 0.10), 1)
-        state.bearing_temp_c = max(state.idler1_temp_c, state.idler2_temp_c, state.idler3_temp_c, state.idler4_temp_c)
-        state.loadcell_1_kn = round(state.tension_kn * 0.502 + random.uniform(-0.06, 0.06), 1)
-        state.loadcell_2_kn = round(state.tension_kn * 0.498 + random.uniform(-0.06, 0.06), 1)
-        state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-250, 250))
+        if state.device_connected and (time.time() - state.hardware_last_rx < 2.5):
+            pass # Keep exact live physical sensor data from MPU6050, DS18B20 & HX711!
+        else:
+            state.idler1_temp_c = round(42.3 + random.uniform(-0.15, 0.15), 1)
+            state.idler2_temp_c = round(51.7 + random.uniform(-0.20, 0.20), 1)
+            state.idler3_temp_c = round(46.8 + random.uniform(-0.12, 0.12), 1)
+            state.idler4_temp_c = round(39.4 + random.uniform(-0.10, 0.10), 1)
+            state.bearing_temp_c = max(state.idler1_temp_c, state.idler2_temp_c, state.idler3_temp_c, state.idler4_temp_c)
+            state.loadcell_1_kn = round(state.tension_kn * 0.502 + random.uniform(-0.06, 0.06), 1)
+            state.loadcell_2_kn = round(state.tension_kn * 0.498 + random.uniform(-0.06, 0.06), 1)
+            state.loadcell_raw_adc = int(state.tension_kn * 186930 + random.randint(-250, 250))
 
     pen_tension = abs(state.tension_kn - 45.0) * 1.6
     pen_temp = max(0.0, state.bearing_temp_c - 60.0) * 1.8
@@ -805,6 +829,194 @@ def toggle_yolo():
     state.yolo_enabled = not state.yolo_enabled
     return {"yolo_enabled": state.yolo_enabled}
 
+
+# ----------------- PHYSICAL HARDWARE SERIAL & WIFI BRIDGE -----------------
+class HardwareBridge:
+    def __init__(self):
+        self.serial_inst = None
+        self.running = False
+        self.thread = None
+        self.target_port = "auto"
+        self.target_baud = 115200
+
+    def get_ports(self):
+        if not SERIAL_AVAILABLE:
+            return []
+        try:
+            return [{"port": p.device, "desc": p.description, "hwid": p.hwid} for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return []
+
+    def connect(self, port="auto", baud=115200):
+        self.disconnect()
+        self.target_port = port
+        self.target_baud = baud
+        self.running = True
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+        return {"status": "connecting", "port": port, "baud": baud}
+
+    def disconnect(self):
+        self.running = False
+        if self.serial_inst and self.serial_inst.is_open:
+            try:
+                self.serial_inst.close()
+            except Exception:
+                pass
+        self.serial_inst = None
+        state.device_connected = False
+        state.hardware_source = "SIMULATED DIGITAL TWIN"
+        state.hardware_port = "NONE"
+
+    def _worker_loop(self):
+        while self.running:
+            try:
+                port_to_open = self.target_port
+                if port_to_open == "auto":
+                    ports = self.get_ports()
+                    if ports:
+                        port_to_open = ports[0]["port"]
+                    else:
+                        time.sleep(1.0)
+                        continue
+
+                state.hardware_port = port_to_open
+                state.hardware_baud = self.target_baud
+
+                self.serial_inst = serial.Serial(port_to_open, self.target_baud, timeout=1.0)
+                state.hardware_source = f"SERIAL: {port_to_open} @ {self.target_baud}bps"
+
+                log_entry = {
+                    "timestamp": time.strftime("%H:%M:%S"),
+                    "event": f"Physical Hardware IoT Connected: {port_to_open} (MPU6050 + DS18B20 + HX711)",
+                    "severity": "INFO"
+                }
+                state.incident_log.insert(0, log_entry)
+
+                while self.running and self.serial_inst.is_open:
+                    line = self.serial_inst.readline().decode('utf-8', errors='ignore').strip()
+                    if not line:
+                        continue
+
+                    # Append to buffer
+                    state.raw_serial_buffer.append(line)
+                    if len(state.raw_serial_buffer) > 25:
+                        state.raw_serial_buffer.pop(0)
+
+                    self.parse_telemetry(line)
+
+            except Exception as e:
+                state.device_connected = False
+                state.hardware_source = f"RETRYING {self.target_port}..."
+                time.sleep(2.0)
+
+    def parse_telemetry(self, raw_str):
+        try:
+            # 1. JSON format
+            if raw_str.startswith("{") and raw_str.endswith("}"):
+                data = json.loads(raw_str)
+            else:
+                # 2. Key-Value format e.g. temp:42.3,weight:2.45
+                data = {}
+                for part in raw_str.split(","):
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        try:
+                            data[k.strip().lower()] = float(v.strip())
+                        except ValueError:
+                            pass
+
+            if not data:
+                return
+
+            state.device_connected = True
+            state.hardware_last_rx = time.time()
+            state.hardware_packet_count += 1
+
+            # DS18B20 Temperature
+            if "temp" in data or "temperature" in data:
+                t = float(data.get("temp", data.get("temperature", state.bearing_temp_c)))
+                state.bearing_temp_c = t
+                state.idler1_temp_c = t
+                state.idler2_temp_c = float(data.get("idler2", round(t * 1.08, 1)))
+                state.idler3_temp_c = float(data.get("idler3", round(t * 0.98, 1)))
+                state.idler4_temp_c = float(data.get("idler4", round(t * 0.92, 1)))
+
+            # HX711 10kg Load Cell
+            if "weight_kg" in data or "weight" in data or "raw_adc" in data or "tension_kn" in data:
+                w_kg = float(data.get("weight_kg", data.get("weight", state.loadcell_weight_kg)))
+                state.loadcell_weight_kg = w_kg
+                if "tension_kn" in data:
+                    ten = float(data["tension_kn"])
+                else:
+                    ten = max(10.0, min(80.0, round(w_kg * 4.5, 1))) if w_kg > 0.05 else 45.0
+                state.tension_kn = ten
+                state.loadcell_1_kn = round(ten * 0.502, 1)
+                state.loadcell_2_kn = round(ten * 0.498, 1)
+                if "raw_adc" in data:
+                    state.loadcell_raw_adc = int(data["raw_adc"])
+
+            # MPU-6050 3-Axis Accelerometer
+            if "ax" in data and "ay" in data and "az" in data:
+                state.vibration_x = round(float(data["ax"]), 2)
+                state.vibration_y = round(float(data["ay"]), 2)
+                state.vibration_z = round(float(data["az"]), 2)
+                if "vib_rms" in data:
+                    state.vibration_rms = round(float(data["vib_rms"]), 2)
+                else:
+                    dz = state.vibration_z - 9.81
+                    state.vibration_rms = round(math.sqrt(state.vibration_x**2 + state.vibration_y**2 + dz**2), 2)
+
+        except Exception:
+            pass
+
+hw_bridge = HardwareBridge()
+
+class HardwareConnectReq(BaseModel):
+    port: str = "auto"
+    baud: int = 115200
+
+class HardwareTelemetryPayload(BaseModel):
+    temp: float = 42.3
+    weight_kg: float = 2.45
+    tension_kn: float = 45.0
+    raw_adc: int = 8412030
+    ax: float = 0.12
+    ay: float = -0.05
+    az: float = 9.81
+    vib_rms: float = 1.85
+
+@app.get("/api/hardware/ports")
+def get_hardware_ports():
+    ports = hw_bridge.get_ports()
+    return {
+        "ports": ports,
+        "connected": state.device_connected,
+        "source": state.hardware_source,
+        "current_port": state.hardware_port,
+        "baud": state.hardware_baud,
+        "packet_count": state.hardware_packet_count,
+        "last_rx": round(time.time() - state.hardware_last_rx, 1) if state.hardware_last_rx > 0 else -1,
+        "raw_lines": state.raw_serial_buffer[-10:]
+    }
+
+@app.post("/api/hardware/connect")
+def connect_hardware(req: HardwareConnectReq):
+    res = hw_bridge.connect(port=req.port, baud=req.baud)
+    return res
+
+@app.post("/api/hardware/disconnect")
+def disconnect_hardware():
+    hw_bridge.disconnect()
+    return {"status": "disconnected"}
+
+@app.post("/api/hardware/telemetry")
+def ingest_hardware_telemetry(req: HardwareTelemetryPayload):
+    state.hardware_source = "WIFI (HTTP POST)"
+    data_dict = req.dict()
+    hw_bridge.parse_telemetry(json.dumps(data_dict))
+    return {"status": "ok", "packet_count": state.hardware_packet_count}
+
 @app.post("/api/toggle_device")
 def toggle_device():
     state.device_connected = not state.device_connected
@@ -866,6 +1078,9 @@ async def websocket_telemetry(websocket: WebSocket):
                 "live_fps": state.live_fps,
                 "detected_objects": state.detected_objects,
                 "device_connected": state.device_connected,
+                "hardware_source": state.hardware_source,
+                "hardware_packet_count": state.hardware_packet_count,
+                "loadcell_weight_kg": round(state.loadcell_weight_kg, 2),
                 "zones": state.zones,
                 "modbus_status": state.modbus_status,
                 "opcua_status": state.opcua_status,
@@ -1441,6 +1656,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="topbar-actions">
+            <button class="btn-ctrl" id="btnHwHeader" onclick="openHardwareModal()" title="Connect Live MPU6050, DS18B20 & HX711 Sensors" style="border-color:var(--gold-border);">
+                <svg class="scada-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg>
+                <span id="hwHeaderLabel">IoT: Sim Mode</span>
+            </button>
+
             <button class="btn-ctrl btn-copper" onclick="openJuryModal()" title="View SIH 26008 Architecture Defense">
                 <svg class="scada-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
                 <span>Jury Briefing</span>
@@ -1865,6 +2085,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </section>
     </main>
 
+
+    <!-- Live Physical IoT Hardware Bridge Modal (MPU6050 + DS18B20 + HX711) -->
+    <div id="hardwareModal" style="position:fixed; inset:0; background:rgba(0,0,0,0.78); z-index:1100; display:none; align-items:center; justify-content:center; backdrop-filter:blur(6px);">
+        <div class="card" style="max-width:680px; width:100%; padding:28px; box-shadow:var(--shadow-skate); border-color:var(--gold-border);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
+                <h3 style="font-size:18px; font-weight:800; display:flex; align-items:center; gap:10px; color:var(--gold);">
+                    <svg class="scada-icon" viewBox="0 0 24 24"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+                    <span>Physical IoT Sensor Hardware Bridge</span>
+                </h3>
+                <span class="chip" id="hwModalStatusBadge">SIMULATED MODE</span>
+            </div>
+
+            <p style="font-size:12.5px; color:var(--text-dim); margin-bottom:18px; line-height:1.5;">
+                Stream real-time physical telemetry from <strong>MPU-6050 (Vibration/XYZ)</strong>, <strong>DS18B20 (Waterproof Temperature)</strong>, and <strong>10 kg Load Cell + HX711</strong> via USB Serial or WiFi:
+            </p>
+
+            <!-- CONNECTION CONTROLS -->
+            <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:18px;">
+                <div style="display:grid; grid-template-columns: 2fr 1fr auto; gap:12px; align-items:flex-end;">
+                    <div>
+                        <label style="display:block; font-size:11px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:6px;">USB COM Port</label>
+                        <select id="selComPort" style="width:100%; padding:9px 12px; border-radius:8px; background:var(--bg-card); border:1px solid var(--border); color:var(--text); font-family:'JetBrains Mono',monospace; font-size:12.5px;">
+                            <option value="auto">Auto-Detect Microcontroller</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display:block; font-size:11px; font-weight:700; color:var(--text-dim); text-transform:uppercase; margin-bottom:6px;">Baud Rate</label>
+                        <select id="selBaud" style="width:100%; padding:9px 12px; border-radius:8px; background:var(--bg-card); border:1px solid var(--border); color:var(--text); font-family:'JetBrains Mono',monospace; font-size:12.5px;">
+                            <option value="115200">115200 bps (Recommended)</option>
+                            <option value="9600">9600 bps</option>
+                            <option value="57600">57600 bps</option>
+                        </select>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn-ctrl" onclick="refreshComPorts()" title="Scan for new COM devices" style="padding:9px 12px;">
+                            <svg class="scada-icon" viewBox="0 0 24 24"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                        </button>
+                        <button class="btn-ctrl btn-copper" id="btnHwConnectToggle" onclick="toggleHwConnection()" style="padding:9px 16px;">
+                            Connect Port
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LIVE HARDWARE SENSOR READINGS PREVIEW -->
+            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-bottom:18px;">
+                <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:12px;">
+                    <div style="font-size:10.5px; font-weight:700; color:var(--text-dim);">1) DS18B20 TEMPERATURE</div>
+                    <div style="font-size:20px; font-weight:800; color:var(--gold); font-family:'JetBrains Mono',monospace;" id="hwLiveTemp">--.-°C</div>
+                    <div style="font-size:10.5px; color:var(--text-faint);">Waterproof Probe</div>
+                </div>
+                <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:12px;">
+                    <div style="font-size:10.5px; font-weight:700; color:var(--text-dim);">2) HX711 10KG LOAD CELL</div>
+                    <div style="font-size:20px; font-weight:800; color:var(--gold); font-family:'JetBrains Mono',monospace;" id="hwLiveWeight">-.-- kg</div>
+                    <div style="font-size:10.5px; color:var(--text-faint);" id="hwLiveTension">--.- kN Dynamic Tension</div>
+                </div>
+                <div style="background:var(--bg-input); border:1px solid var(--border); border-radius:10px; padding:12px;">
+                    <div style="font-size:10.5px; font-weight:700; color:var(--text-dim);">3) MPU6050 VIBRATION</div>
+                    <div style="font-size:20px; font-weight:800; color:var(--gold); font-family:'JetBrains Mono',monospace;" id="hwLiveVib">-.-- mm/s</div>
+                    <div style="font-size:10.5px; color:var(--text-faint);" id="hwLiveXyz">X:0.0 Y:0.0 Z:9.8</div>
+                </div>
+            </div>
+
+            <!-- REAL-TIME SERIAL PACKET MONITOR -->
+            <div style="margin-bottom:18px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <span style="font-size:11px; font-weight:700; color:var(--text-dim); text-transform:uppercase;">Live Serial Ingestion Terminal</span>
+                    <span style="font-size:11px; color:var(--text-faint);" id="hwPacketCounter">Packets Received: 0</span>
+                </div>
+                <div id="hwTerminalBox" style="background:#0a0907; border:1px solid var(--border); border-radius:8px; padding:12px; height:120px; overflow-y:auto; font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--gold); line-height:1.4;">
+                    [INFO] Waiting for physical USB connection or WiFi HTTP packets...
+                </div>
+            </div>
+
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-size:11.5px; color:var(--text-faint);">Arduino firmware file available at <code>firmware/ayask_iot_sensors.ino</code></span>
+                <button class="btn-ctrl" onclick="closeHardwareModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Camera Settings Modal -->
     <div id="settingsModal" style="position:fixed; inset:0; background:rgba(0,0,0,0.70); z-index:1000; display:none; align-items:center; justify-content:center;">
         <div class="card" style="max-width:500px; width:100%; padding:28px; box-shadow:var(--shadow-skate);">
@@ -2207,6 +2508,112 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
+
+        // ===================== PHYSICAL HARDWARE SENSOR BRIDGE =====================
+        let hwPollTimer = null;
+
+        function openHardwareModal() {
+            document.getElementById('hardwareModal').style.display = 'flex';
+            refreshComPorts();
+            if (!hwPollTimer) {
+                hwPollTimer = setInterval(pollHardwareStatus, 1000);
+            }
+        }
+
+        function closeHardwareModal() {
+            document.getElementById('hardwareModal').style.display = 'none';
+            if (hwPollTimer) {
+                clearInterval(hwPollTimer);
+                hwPollTimer = null;
+            }
+        }
+
+        async function refreshComPorts() {
+            try {
+                const r = await fetch('/api/hardware/ports');
+                const d = await r.json();
+                const sel = document.getElementById('selComPort');
+                const curVal = sel.value;
+                sel.innerHTML = '<option value="auto">Auto-Detect Microcontroller</option>';
+                if (d.ports && d.ports.length > 0) {
+                    d.ports.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.port;
+                        opt.innerText = `${p.port} — ${p.desc}`;
+                        sel.appendChild(opt);
+                    });
+                }
+                if (curVal) sel.value = curVal;
+                updateHardwareModalUI(d);
+            } catch (err) {
+                console.error('Error fetching ports:', err);
+            }
+        }
+
+        async function toggleHwConnection() {
+            const btn = document.getElementById('btnHwConnectToggle');
+            const port = document.getElementById('selComPort').value;
+            const baud = parseInt(document.getElementById('selBaud').value, 10);
+
+            if (btn.innerText.includes('Disconnect')) {
+                await fetch('/api/hardware/disconnect', { method: 'POST' });
+            } else {
+                await fetch('/api/hardware/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ port: port, baud: baud })
+                });
+            }
+            setTimeout(refreshComPorts, 400);
+        }
+
+        async function pollHardwareStatus() {
+            try {
+                const r = await fetch('/api/hardware/ports');
+                const d = await r.json();
+                updateHardwareModalUI(d);
+            } catch (e) {}
+        }
+
+        function updateHardwareModalUI(d) {
+            const badge = document.getElementById('hwModalStatusBadge');
+            const btn = document.getElementById('btnHwConnectToggle');
+            const term = document.getElementById('hwTerminalBox');
+            const countEl = document.getElementById('hwPacketCounter');
+            const hdrLabel = document.getElementById('hwHeaderLabel');
+            const hdrBtn = document.getElementById('btnHwHeader');
+            const btnHwChan = document.getElementById('btnHwChannel');
+
+            if (d.connected) {
+                badge.className = 'chip';
+                badge.style.color = 'var(--safe-gold)';
+                badge.style.borderColor = 'var(--safe-gold)';
+                badge.innerText = `CONNECTED (${d.current_port})`;
+                btn.innerText = 'Disconnect';
+                btn.className = 'btn-ctrl btn-danger';
+                if (hdrLabel) hdrLabel.innerText = `IoT: ${d.current_port} (10Hz)`;
+                if (hdrBtn) hdrBtn.style.borderColor = 'var(--safe-gold)';
+                if (btnHwChan) btnHwChan.innerText = `Hardware: ${d.current_port}`;
+            } else {
+                badge.className = 'chip';
+                badge.style.color = 'var(--text-dim)';
+                badge.style.borderColor = 'var(--border)';
+                badge.innerText = 'SIMULATED MODE';
+                btn.innerText = 'Connect Port';
+                btn.className = 'btn-ctrl btn-copper';
+                if (hdrLabel) hdrLabel.innerText = 'IoT: Sim Mode';
+                if (hdrBtn) hdrBtn.style.borderColor = 'var(--gold-border)';
+                if (btnHwChan) btnHwChan.innerText = 'Hardware: Sim';
+            }
+
+            if (countEl) countEl.innerText = `Packets Received: ${d.packet_count}`;
+
+            if (d.raw_lines && d.raw_lines.length > 0 && term) {
+                term.innerHTML = d.raw_lines.map(l => `<div>&gt; ${l}</div>`).join('');
+                term.scrollTop = term.scrollHeight;
+            }
+        }
+
         // ===================== WEBSOCKET =====================
         let ws;
         function connectWs() {
@@ -2267,6 +2674,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 // Active Fault highlight
                 updateFaultButtonsUI(d.active_fault);
+
+                // Live Hardware Modal Previews
+                const hwTemp = document.getElementById('hwLiveTemp');
+                if (hwTemp) hwTemp.innerText = `${d.temperature.toFixed(1)}°C`;
+                const hwWeight = document.getElementById('hwLiveWeight');
+                if (hwWeight) hwWeight.innerText = `${(d.loadcell_weight_kg || (d.tension / 4.5)).toFixed(2)} kg`;
+                const hwTension = document.getElementById('hwLiveTension');
+                if (hwTension) hwTension.innerText = `${d.tension.toFixed(1)} kN Dynamic Tension`;
+                const hwVib = document.getElementById('hwLiveVib');
+                if (hwVib) hwVib.innerText = `${d.vibration.toFixed(2)} mm/s`;
+                const hwXyz = document.getElementById('hwLiveXyz');
+                if (hwXyz) hwXyz.innerText = `X:${d.vib_x} Y:${d.vib_y} Z:${d.vib_z}`;
 
                 // Multi-Point Idler Temperatures Update
                 if (d.idlers && d.idlers.length >= 4) {
