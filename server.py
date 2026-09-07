@@ -2867,16 +2867,26 @@ def dashboard():
 
 if __name__ == "__main__":
     import uvicorn
+    import socket
     port = int(os.environ.get("PORT", 8000))
-    # In cloud environments (Render, Railway, Heroku), bind to 0.0.0.0
-    # Locally on Windows, bind to 127.0.0.1 so Uvicorn shows clickable http://127.0.0.1:8000 (0.0.0.0 throws ERR_ADDRESS_INVALID in Windows Chrome)
-    is_cloud = "PORT" in os.environ
-    host = "0.0.0.0" if is_cloud else "127.0.0.1"
+
+    # Always bind to 0.0.0.0 so ESP32 / any device on the same WiFi LAN can POST
+    # sensor data to http://<your-pc-ip>:8000/api/hardware/telemetry
+    # Browser on this PC: use http://localhost:8000 (NOT 0.0.0.0)
+    host = "0.0.0.0"
+
+    # Print the LAN IP so you can paste it into the ESP32 firmware
+    try:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        lan_ip = "unknown"
 
     print("\n" + "=" * 68)
     print("  AYASK SCADA Server Started Successfully!")
-    print(f"  Open in your browser: http://localhost:{port} or http://127.0.0.1:{port}")
-    print("  (Note: Do NOT type 0.0.0.0 in Windows Chrome)")
+    print(f"  Local browser  : http://localhost:{port}")
+    print(f"  LAN / WiFi IP  : http://{lan_ip}:{port}   <-- paste into ESP32 firmware")
+    print(f"  ESP32 POST URL : http://{lan_ip}:{port}/api/hardware/telemetry")
     print("=" * 68 + "\n")
 
     uvicorn.run(app, host=host, port=port)
+
