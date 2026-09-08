@@ -21,7 +21,7 @@ import re
 import hashlib
 import secrets
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 import threading
@@ -852,7 +852,10 @@ class HardwareBridge:
         self.target_port = port
         self.target_baud = baud
         self.running = True
-        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        if port.startswith("http://") or port.startswith("https://") or (":" in port and not port.startswith("COM")):
+            self.thread = threading.Thread(target=self._wifi_worker_loop, daemon=True)
+        else:
+            self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.thread.start()
         return {"status": "connecting", "port": port, "baud": baud}
 
@@ -867,6 +870,38 @@ class HardwareBridge:
         state.device_connected = False
         state.hardware_source = "SIMULATED DIGITAL TWIN"
         state.hardware_port = "NONE"
+
+    def _wifi_worker_loop(self):
+        import urllib.request
+        url = self.target_port.strip()
+        if not url.startswith("http"):
+            url = f"http://{url}"
+        if not url.endswith("/data") and not url.endswith("/"):
+            url = f"{url}/data"
+        state.hardware_source = f"WIFI: {url}"
+        state.hardware_port = url
+
+        log_entry = {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "event": f"ESP32 Wireless Sensor Node Polling Active: {url}",
+            "severity": "INFO"
+        }
+        state.incident_log.insert(0, log_entry)
+
+        while self.running:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "AYASK-SCADA/1.0"})
+                with urllib.request.urlopen(req, timeout=1.8) as resp:
+                    payload = resp.read().decode('utf-8')
+                    state.raw_serial_buffer.append(payload[:120])
+                    if len(state.raw_serial_buffer) > 25:
+                        state.raw_serial_buffer.pop(0)
+                    self.parse_telemetry(payload)
+                time.sleep(0.5)
+            except Exception as e:
+                state.device_connected = False
+                state.hardware_source = f"RETRYING WIFI ({url})..."
+                time.sleep(2.0)
 
     def _worker_loop(self):
         while self.running:
@@ -933,39 +968,72 @@ class HardwareBridge:
             state.hardware_last_rx = time.time()
             state.hardware_packet_count += 1
 
-            # DS18B20 Temperature
-            if "temp" in data or "temperature" in data:
-                t = float(data.get("temp", data.get("temperature", state.bearing_temp_c)))
-                state.bearing_temp_c = t
-                state.idler1_temp_c = t
-                state.idler2_temp_c = float(data.get("idler2", round(t * 1.08, 1)))
-                state.idler3_temp_c = float(data.get("idler3", round(t * 0.98, 1)))
-                state.idler4_temp_c = float(data.get("idler4", round(t * 0.92, 1)))
+            # DS18B20 Temperatures (Idler 1, Idler 2, Bearing)
+            t1 = data.get("idler1_temperature") if data.get("idler1_temperature") is not None else data.get("temp", data.get("temperature"))
+            if t1 is not None:
+                try:
+                    t1_val = float(t1)
+                    state.bearing_temp_c = t1_val
+                    state.idler1_temp_c = t1_val
+                except (ValueError, TypeError):
+                    pass
+
+            t2 = data.get("idler2_temperature") if data.get("idler2_temperature") is not None else data.get("idler2")
+            if t2 is not None:
+                try:
+                    state.idler2_temp_c = float(t2)
+                except (ValueError, TypeError):
+                    pass
+            elif t1 is not None:
+                state.idler2_temp_c = round(state.bearing_temp_c * 1.08, 1)
 
             # HX711 10kg Load Cell
-            if "weight_kg" in data or "weight" in data or "raw_adc" in data or "tension_kn" in data:
-                w_kg = float(data.get("weight_kg", data.get("weight", state.loadcell_weight_kg)))
-                state.loadcell_weight_kg = w_kg
-                if "tension_kn" in data:
-                    ten = float(data["tension_kn"])
-                else:
+            w_raw = data.get("load") if data.get("load") is not None else data.get("weight_kg", data.get("weight"))
+            if w_raw is not None:
+                try:
+                    w_kg = float(w_raw)
+                    state.loadcell_weight_kg = w_kg
                     ten = max(10.0, min(80.0, round(w_kg * 4.5, 1))) if w_kg > 0.05 else 45.0
-                state.tension_kn = ten
-                state.loadcell_1_kn = round(ten * 0.502, 1)
-                state.loadcell_2_kn = round(ten * 0.498, 1)
-                if "raw_adc" in data:
-                    state.loadcell_raw_adc = int(data["raw_adc"])
+                    state.tension_kn = ten
+                    state.loadcell_1_kn = round(ten * 0.502, 1)
+                    state.loadcell_2_kn = round(ten * 0.498, 1)
+                except (ValueError, TypeError):
+                    pass
+            elif "tension_kn" in data and data["tension_kn"] is not None:
+                try:
+                    ten = float(data["tension_kn"])
+                    state.tension_kn = ten
+                    state.loadcell_1_kn = round(ten * 0.502, 1)
+                    state.loadcell_2_kn = round(ten * 0.498, 1)
+                except (ValueError, TypeError):
+                    pass
 
-            # MPU-6050 3-Axis Accelerometer
-            if "ax" in data and "ay" in data and "az" in data:
-                state.vibration_x = round(float(data["ax"]), 2)
-                state.vibration_y = round(float(data["ay"]), 2)
-                state.vibration_z = round(float(data["az"]), 2)
-                if "vib_rms" in data:
-                    state.vibration_rms = round(float(data["vib_rms"]), 2)
-                else:
+            if "raw_adc" in data and data["raw_adc"] is not None:
+                try:
+                    state.loadcell_raw_adc = int(data["raw_adc"])
+                except (ValueError, TypeError):
+                    pass
+
+            # MPU-6050 Vibration / Accelerometer
+            if "vibration" in data and data["vibration"] is not None:
+                try:
+                    state.vibration_rms = round(float(data["vibration"]), 3)
+                except (ValueError, TypeError):
+                    pass
+            elif "vib_rms" in data and data["vib_rms"] is not None:
+                try:
+                    state.vibration_rms = round(float(data["vib_rms"]), 3)
+                except (ValueError, TypeError):
+                    pass
+            elif "ax" in data and "ay" in data and "az" in data:
+                try:
+                    state.vibration_x = round(float(data["ax"]), 2)
+                    state.vibration_y = round(float(data["ay"]), 2)
+                    state.vibration_z = round(float(data["az"]), 2)
                     dz = state.vibration_z - 9.81
                     state.vibration_rms = round(math.sqrt(state.vibration_x**2 + state.vibration_y**2 + dz**2), 2)
+                except (ValueError, TypeError):
+                    pass
 
         except Exception:
             pass
@@ -1011,9 +1079,12 @@ def disconnect_hardware():
     return {"status": "disconnected"}
 
 @app.post("/api/hardware/telemetry")
-def ingest_hardware_telemetry(req: HardwareTelemetryPayload):
+async def ingest_hardware_telemetry(request: Request):
     state.hardware_source = "WIFI (HTTP POST)"
-    data_dict = req.dict()
+    try:
+        data_dict = await request.json()
+    except Exception:
+        data_dict = {}
     hw_bridge.parse_telemetry(json.dumps(data_dict))
     return {"status": "ok", "packet_count": state.hardware_packet_count}
 
@@ -2534,7 +2605,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const d = await r.json();
                 const sel = document.getElementById('selComPort');
                 const curVal = sel.value;
-                sel.innerHTML = '<option value="auto">Auto-Detect Microcontroller</option>';
+                sel.innerHTML = '<option value="auto">Auto-Detect Microcontroller (USB)</option><option value="wifi_ip">Connect via ESP32 WiFi IP / Host...</option>';
                 if (d.ports && d.ports.length > 0) {
                     d.ports.forEach(p => {
                         const opt = document.createElement('option');
@@ -2552,12 +2623,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         async function toggleHwConnection() {
             const btn = document.getElementById('btnHwConnectToggle');
-            const port = document.getElementById('selComPort').value;
+            let port = document.getElementById('selComPort').value;
             const baud = parseInt(document.getElementById('selBaud').value, 10);
 
             if (btn.innerText.includes('Disconnect')) {
                 await fetch('/api/hardware/disconnect', { method: 'POST' });
             } else {
+                if (port === 'wifi_ip') {
+                    const ip = prompt("Enter ESP32 IP address or URL (e.g. 192.168.1.100 or http://192.168.1.100/data):", "192.168.1.100");
+                    if (!ip) return;
+                    port = ip.trim();
+                }
                 await fetch('/api/hardware/connect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },

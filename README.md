@@ -69,20 +69,20 @@ The system includes ready-to-flash firmware for Arduino and ESP32 microcontrolle
 | **MPU-6050** | `SDA` | GPIO 21 | A4 | I2C Data |
 | **MPU-6050** | `SCL` | GPIO 22 | A5 | I2C Clock |
 | **DS18B20** | `DATA` | GPIO 4 | D2 | 1-Wire (add 4.7kΩ pull-up to VCC) |
-| **HX711** | `DT` | GPIO 16 | D3 | Load Cell Serial Data |
-| **HX711** | `SCK` | GPIO 17 | D4 | Load Cell Clock |
+| **HX711** | `DT` | GPIO 18 | D3 | Load Cell Serial Data |
+| **HX711** | `SCK` | GPIO 19 | D4 | Load Cell Clock |
 
 ### 2. Flash the Microcontroller
 1. Open the Arduino IDE.
 2. Install libraries via Library Manager: `OneWire`, `DallasTemperature`, `HX711`.
-3. Open [`firmware/ayask_iot_sensors.ino`](firmware/ayask_iot_sensors.ino).
-4. Select your board and port, then click **Upload**.
+3. Open [`firmware/ayask_wifi_sensors.ino`](firmware/ayask_wifi_sensors.ino).
+4. Configure your WiFi credentials (`WIFI_SSID` & `WIFI_PASSWORD`).
+5. Select your ESP32 board and COM port, then click **Upload**.
 
 ### 3. Connect to Dashboard
-1. Plug the microcontroller into your PC via USB.
-2. On the SCADA dashboard top bar, click **`IoT: Sim Mode`**.
-3. In the Hardware Bridge modal, select your COM port and click **Connect Port**.
-4. The dashboard will switch from simulation to streaming your **exact live physical sensor measurements**!
+- **WiFi Mode**: On the SCADA dashboard, click **`IoT: Sim Mode`**, choose **"Connect via ESP32 WiFi IP"**, enter your ESP32's IP, and click **Connect**.
+- **USB Serial Mode**: Plug the ESP32 in via USB, select your COM port at 115200 bps, and click **Connect Port**.
+The dashboard will switch from simulation to streaming your **exact live physical sensor measurements**!
 
 ---
 
