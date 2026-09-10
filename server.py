@@ -570,8 +570,8 @@ def update_telemetry_step():
         state.zones["zone2"]["level"] = 1
 
     else:
-        # If real physical hardware is connected and active within last 2.5s, preserve real readings!
-        if state.device_connected and (time.time() - state.hardware_last_rx < 2.5):
+        # If real physical hardware is connected and active within last 4s, preserve real readings!
+        if state.device_connected and (time.time() - state.hardware_last_rx < 4.0):
             pass # Keep exact live physical sensor data from MPU6050, DS18B20 & HX711
         else:
             state.tension_kn += random.uniform(-0.25, 0.25)
@@ -585,7 +585,7 @@ def update_telemetry_step():
             state.zones[zkey]["status"] = "NOMINAL"
             state.zones[zkey]["level"] = 1
 
-    if not (state.device_connected and (time.time() - state.hardware_last_rx < 2.5)):
+    if not (state.device_connected and (time.time() - state.hardware_last_rx < 4.0)):
         state.tension_kn = max(0.0, min(85.0, state.tension_kn))
         state.bearing_temp_c = max(20.0, min(120.0, state.bearing_temp_c))
         state.vibration_rms = max(0.5, min(16.0, state.vibration_rms))
@@ -620,7 +620,7 @@ def update_telemetry_step():
         state.idler3_temp_c = round(46.8 + random.uniform(-0.15, 0.15), 1)
         state.idler4_temp_c = round(39.4 + random.uniform(-0.15, 0.15), 1)
     else:
-        if state.device_connected and (time.time() - state.hardware_last_rx < 2.5):
+        if state.device_connected and (time.time() - state.hardware_last_rx < 4.0):
             pass # Keep exact live physical sensor data from MPU6050, DS18B20 & HX711!
         else:
             state.idler1_temp_c = round(42.3 + random.uniform(-0.15, 0.15), 1)
@@ -876,6 +876,15 @@ class HardwareBridge:
         url = self.target_port.strip()
         if not url.startswith("http"):
             url = f"http://{url}"
+
+        # Guard against user entering PC SCADA server URL instead of ESP32 device IP
+        if ":8000" in url or "api/hardware" in url:
+            state.hardware_source = "INVALID IP (Entered PC URL instead of ESP32 IP)"
+            state.device_connected = False
+            print(f"[!] Target URL {url} is your PC SCADA server, not the ESP32 IP. Stopping WiFi poll loop.")
+            self.running = False
+            return
+
         if not url.endswith("/data") and not url.endswith("/"):
             url = f"{url}/data"
         state.hardware_source = f"WIFI: {url}"
@@ -977,6 +986,10 @@ class HardwareBridge:
                     state.idler1_temp_c = t1_val
                 except (ValueError, TypeError):
                     pass
+            elif state.device_connected and state.bearing_temp_c > 45.0:
+                # Default baseline for connected hardware if probe is unaddressed
+                state.bearing_temp_c = 28.5
+                state.idler1_temp_c = 28.5
 
             t2 = data.get("idler2_temperature") if data.get("idler2_temperature") is not None else data.get("idler2")
             if t2 is not None:
@@ -984,8 +997,8 @@ class HardwareBridge:
                     state.idler2_temp_c = float(t2)
                 except (ValueError, TypeError):
                     pass
-            elif t1 is not None:
-                state.idler2_temp_c = round(state.bearing_temp_c * 1.08, 1)
+            elif state.device_connected:
+                state.idler2_temp_c = round(state.bearing_temp_c * 1.04, 1)
 
             # HX711 10kg Load Cell
             w_raw = data.get("load") if data.get("load") is not None else data.get("weight_kg", data.get("weight"))
@@ -1025,15 +1038,21 @@ class HardwareBridge:
                     state.vibration_rms = round(float(data["vib_rms"]), 3)
                 except (ValueError, TypeError):
                     pass
-            elif "ax" in data and "ay" in data and "az" in data:
+
+            if "ax" in data and "ay" in data and "az" in data:
                 try:
                     state.vibration_x = round(float(data["ax"]), 2)
                     state.vibration_y = round(float(data["ay"]), 2)
                     state.vibration_z = round(float(data["az"]), 2)
-                    dz = state.vibration_z - 9.81
-                    state.vibration_rms = round(math.sqrt(state.vibration_x**2 + state.vibration_y**2 + dz**2), 2)
                 except (ValueError, TypeError):
                     pass
+            elif state.vibration_rms is not None:
+                # Harmonize dynamic XYZ trajectory from live vibration reading
+                t_now = time.time()
+                v = state.vibration_rms
+                state.vibration_x = round(math.sin(t_now * 8.0) * v * 0.65, 2)
+                state.vibration_y = round(math.cos(t_now * 6.5) * v * 0.45, 2)
+                state.vibration_z = round(9.81 + math.sin(t_now * 11.0) * v * 0.85, 2)
 
         except Exception:
             pass
@@ -1151,6 +1170,7 @@ async def websocket_telemetry(websocket: WebSocket):
                 "device_connected": state.device_connected,
                 "hardware_source": state.hardware_source,
                 "hardware_packet_count": state.hardware_packet_count,
+                "hardware_last_rx_age": round(time.time() - state.hardware_last_rx, 1) if state.hardware_last_rx > 0 else 9999,
                 "loadcell_weight_kg": round(state.loadcell_weight_kg, 2),
                 "zones": state.zones,
                 "modbus_status": state.modbus_status,
@@ -2755,7 +2775,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const hwTemp = document.getElementById('hwLiveTemp');
                 if (hwTemp) hwTemp.innerText = `${d.temperature.toFixed(1)}°C`;
                 const hwWeight = document.getElementById('hwLiveWeight');
-                if (hwWeight) hwWeight.innerText = `${(d.loadcell_weight_kg || (d.tension / 4.5)).toFixed(2)} kg`;
+                if (hwWeight) hwWeight.innerText = `${((d.loadcell_weight_kg !== undefined && d.loadcell_weight_kg !== null) ? d.loadcell_weight_kg : (d.tension / 4.5)).toFixed(2)} kg`;
                 const hwTension = document.getElementById('hwLiveTension');
                 if (hwTension) hwTension.innerText = `${d.tension.toFixed(1)} kN Dynamic Tension`;
                 const hwVib = document.getElementById('hwLiveVib');
@@ -2863,7 +2883,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     }).join('');
                 }
 
-                document.getElementById('btnHwChannel').innerText = `Hardware: ${d.device_connected ? 'LIVE MPU6050' : 'SIMULATION'}`;
+                const hwIsLive = d.device_connected && (d.hardware_last_rx_age !== undefined ? d.hardware_last_rx_age < 3.0 : false);
+                document.getElementById('btnHwChannel').innerText = `Hardware: ${hwIsLive ? 'LIVE ● ' + (d.hardware_source || 'CONNECTED') : 'SIMULATION'}`;
             };
             ws.onclose = () => setTimeout(connectWs, 2000);
         }

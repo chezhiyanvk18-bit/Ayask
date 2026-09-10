@@ -26,8 +26,8 @@
 // WIFI CONFIGURATION -- EDIT YOUR NETWORK DETAILS HERE
 // =====================================================
 
-const char* WIFI_SSID     = "Dwifi";                   // <-- Replace with your WiFi SSID / Hotspot Name
-const char* WIFI_PASSWORD = "111222333";  // <-- Replace with your WiFi Password
+const char* WIFI_SSID     = "Power_House";                   // <-- Replace with your WiFi SSID / Hotspot Name
+const char* WIFI_PASSWORD = "14211421";  // <-- Replace with your WiFi Password
 
 WebServer server(80);
 
@@ -65,16 +65,14 @@ WebServer server(80);
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// Hardcoded 64-bit ROM addresses for Idler 1 and Idler 2
-DeviceAddress idler1 = {
-  0x28, 0xFA, 0x04, 0x43,
-  0x98, 0x0D, 0x00, 0x50
-};
+// DS18B20 ROM addresses – auto-discovered at startup from the 1-Wire bus.
+// Index 0 → idler1, Index 1 → idler2.
+// Filled in setup() via sensors.getDeviceAddress() — no hardcoded ROM needed.
+DeviceAddress idler1 = { 0,0,0,0,0,0,0,0 };
+DeviceAddress idler2 = { 0,0,0,0,0,0,0,0 };
 
-DeviceAddress idler2 = {
-  0x28, 0x9E, 0x11, 0x43,
-  0x98, 0x22, 0x00, 0x38
-};
+bool idler1Found = false;
+bool idler2Found = false;
 
 // Non-blocking temperature conversion state
 bool temperatureConversionRunning = false;
@@ -446,8 +444,8 @@ void finishTemperatureConversion()
     return;
   }
 
-  float temp1 = sensors.getTempC(idler1);
-  float temp2 = sensors.getTempC(idler2);
+  float temp1 = idler1Found ? sensors.getTempC(idler1) : DEVICE_DISCONNECTED_C;
+  float temp2 = idler2Found ? sensors.getTempC(idler2) : DEVICE_DISCONNECTED_C;
 
   // Idler 1
   if (
@@ -794,25 +792,37 @@ void setup()
   // Do not block while waiting for conversion
   sensors.setWaitForConversion(false);
 
+  int sensorCount = sensors.getDeviceCount();
   Serial.print("DS18B20 Sensors detected: ");
-  Serial.println(sensors.getDeviceCount());
+  Serial.println(sensorCount);
 
-  if (sensors.isConnected(idler1))
-  {
-    Serial.println("IDLER 1 TEMPERATURE: CONNECTED");
-  }
-  else
-  {
-    Serial.println("IDLER 1 TEMPERATURE: NOT DETECTED (Check 64-bit ROM Address)");
+  // Auto-discover ROM addresses by bus index (no hardcoding needed)
+  if (sensorCount >= 1 && sensors.getDeviceAddress(idler1, 0)) {
+    idler1Found = true;
+    sensors.setResolution(idler1, 9);
+    Serial.print("IDLER 1 ROM: ");
+    for (int i = 0; i < 8; i++) {
+      if (idler1[i] < 0x10) Serial.print("0");
+      Serial.print(idler1[i], HEX);
+      if (i < 7) Serial.print(",");
+    }
+    Serial.println(" → CONNECTED");
+  } else {
+    Serial.println("IDLER 1 TEMPERATURE: NOT DETECTED (no sensor at bus index 0)");
   }
 
-  if (sensors.isConnected(idler2))
-  {
-    Serial.println("IDLER 2 TEMPERATURE: CONNECTED");
-  }
-  else
-  {
-    Serial.println("IDLER 2 TEMPERATURE: NOT DETECTED (Check 64-bit ROM Address)");
+  if (sensorCount >= 2 && sensors.getDeviceAddress(idler2, 1)) {
+    idler2Found = true;
+    sensors.setResolution(idler2, 9);
+    Serial.print("IDLER 2 ROM: ");
+    for (int i = 0; i < 8; i++) {
+      if (idler2[i] < 0x10) Serial.print("0");
+      Serial.print(idler2[i], HEX);
+      if (i < 7) Serial.print(",");
+    }
+    Serial.println(" → CONNECTED");
+  } else {
+    Serial.println("IDLER 2 TEMPERATURE: NOT DETECTED (no sensor at bus index 1)");
   }
 
   // ===================================================
